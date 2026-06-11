@@ -39,15 +39,19 @@
 // cooperative scans / reductions below are convergent; out-of-range
 // threads contribute zeros / no-error and still reach every barrier.
 //
-// KNOWN PERF CLIFF (v1, documented decision): one thread owns one whole
-// string, so a single multi-KB string serializes on one lane while its 31
-// SIMD siblings idle (worst case: one giant escaped string = one thread
-// doing all the work). Correctness-first for M4; if M5 profiling shows it,
-// the valve goes HERE — bucket strings by raw length in the runner and
-// dispatch a `strings_unescape_tg` variant (one THREADGROUP per long
-// string: cooperative 16B-block copy for the no-escape prefix, lane 0
-// sequential for escape tails) for entries above a threshold, exactly like
-// K1's escape-carry valve splits rare hard cases out of the hot kernel.
+// LONG-STRING VALVE (the availability fix for the v1 thread-per-string
+// cliff): one thread owns one whole string, so without a valve a single
+// multi-MB string would serialize the entire parse on one lane (latency,
+// potential command-buffer timeout). Strings whose raw_len exceeds
+// MJ_LONG_STRING_THRESHOLD are therefore NOT processed here: the thread
+// appends the STRING-LIST INDEX to a long-string fixup list via a device
+// atomic counter (order irrelevant; the CPU sorts) and contributes
+// no-error to the fold. After the command buffer completes, the CPU patch
+// pass (`gpu::strings::patch_long_strings`, the reference unescaper)
+// writes the flagged records into their precomputed slots — possible
+// precisely because record offsets are pure token-position math
+// (docs/tape-format.md's raw-length allocation), independent of content.
+// This is the K10 number-fixup pattern applied to K11.
 //
 // Memory safety: every write lands inside the exact-size allocations the
 // CPU made from the K7 totals — record bytes stay inside the record's own
@@ -74,6 +78,17 @@ constant constexpr uint MJ_ERR_STRING_CONTROL = 24; // SyntaxErrorKind::ControlC
 
 // Strings per K11 threadgroup: one per thread.
 constant constexpr uint MJ_STR_CHUNK_STRINGS = THREADGROUP_SIZE;
+
+// Long-string valve threshold: strings with raw_len STRICTLY ABOVE this
+// many bytes are deferred to the CPU patch pass instead of being walked by
+// one GPU thread. 16384 (one 16 KiB page) is long enough that real-world
+// strings almost never cross it (JSON string values are overwhelmingly
+// sub-KB; the GPU keeps the whole hot path), yet short enough that the
+// worst case a single lane ever owns is one page-sized walk — never
+// megabytes — bounding K11's serial tail regardless of input shape.
+// Mirror LONG_STRING_THRESHOLD in src/gpu/strings.rs — keep in sync (a
+// Rust test parses this file and pins them).
+constant constexpr uint MJ_LONG_STRING_THRESHOLD = 16384;
 
 // Fast-path block width in bytes (the vectorized clean-scan grain).
 constant constexpr uint MJ_STR_BLOCK = 16;
@@ -386,10 +401,14 @@ static inline uint64_t mj_str_unescape_one(
 }
 
 // K11: one thread per string-list entry, MJ_STR_CHUNK_STRINGS entries per
-// threadgroup. Validates + unescapes every string, writes the records and
-// string tape words, and min-reduces one packed error word per chunk into
-// chunk_error (thread 0 plain store, no device atomics — the K6 pattern);
-// `structure_finalize` folds those into header.error afterwards.
+// threadgroup. Validates + unescapes every string at or under the
+// long-string threshold, writes the records and string tape words, and
+// min-reduces one packed error word per chunk into chunk_error (thread 0
+// plain store, no device atomics — the K6 pattern); `structure_finalize`
+// folds those into header.error afterwards. Strings ABOVE the threshold
+// are appended (string-list index) to the long-string fixup list instead —
+// the CPU patch pass owns their records, tape words AND their error
+// verdicts (see the valve note in the header comment).
 //
 //   params.element_count = string_total
 //   params.reserved0     = tape length in words (defensive bound)
@@ -403,7 +422,9 @@ kernel void strings_unescape(
     device uchar* stringbuf [[buffer(5)]],
     device ulong* tape [[buffer(6)]],
     device ulong* chunk_error [[buffer(7)]],
-    constant MjParams& params [[buffer(8)]],
+    device atomic_uint* long_count [[buffer(8)]],
+    device uint* long_list [[buffer(9)]],
+    constant MjParams& params [[buffer(10)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]])
 {
@@ -414,9 +435,27 @@ kernel void strings_unescape(
 
     uint64_t err = MJ_HEADER_NO_ERROR;
     if (s < n) {
-        err = mj_str_unescape_one(input, tok_pos, string_tokens, record_offsets,
-                                  tape_ofs, stringbuf, tape, s,
-                                  params.reserved1, params.reserved0);
+        // The long-string valve: raw_len is pure token-position math (the
+        // same `close - open - 1` mj_str_unescape_one recomputes), so the
+        // routing decision needs no content reads.
+        ulong t = ulong(string_tokens[s]);
+        ulong raw_len = (t + 1 < params.reserved1)
+            ? ulong(tok_pos[t + 1] - tok_pos[t]) - 1
+            : 0;
+        if (raw_len > ulong(MJ_LONG_STRING_THRESHOLD)) {
+            // Defer to the CPU patch pass: append the string-list index
+            // (at most one append per thread, so slot < string_total and
+            // the index-sized list the runner allocated cannot overflow).
+            uint slot = atomic_fetch_add_explicit(long_count, 1u,
+                                                  memory_order_relaxed);
+            long_list[slot] = uint(s);
+            // err stays NO_ERROR: this string's verdict belongs to the CPU.
+        } else {
+            err = mj_str_unescape_one(input, tok_pos, string_tokens,
+                                      record_offsets, tape_ofs, stringbuf,
+                                      tape, s, params.reserved1,
+                                      params.reserved0);
+        }
     }
 
     // Deterministic per-chunk min (every thread reaches the barrier; the

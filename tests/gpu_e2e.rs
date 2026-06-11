@@ -614,7 +614,255 @@ mod proptests {
     }
 }
 
-// --- 6. Manual timing prints (informational only; M5 owns perf) --------------------
+// --- 6. The K11 long-string valve ---------------------------------------------------
+
+/// Regressions for the long-string availability valve: strings with
+/// `raw_len > LONG_STRING_THRESHOLD` are unescaped by the CPU patch pass
+/// (`gpu::strings::patch_long_strings`) instead of one GPU lane, mirroring
+/// the K10 number-fixup pattern. Every accepted case asserts the fixup
+/// list was actually exercised AND bit-matches the reference
+/// (tape + records); see `src/gpu/strings.rs` for the runner-level
+/// boundary/rejection twins.
+mod long_strings {
+    use metal_json::gpu::{GpuParse, GpuPipeline, LONG_STRING_THRESHOLD};
+    use metal_json::metal::MetalContext;
+    use metal_json::{Error, SyntaxErrorKind};
+
+    use super::{common, diff_backends};
+
+    /// `\u` + `hex` escape text, built at runtime (the literal sequence
+    /// must not appear in source — the src/gpu/strings.rs convention).
+    fn u_esc(hex: &str) -> String {
+        format!("{}u{hex}", '\\')
+    }
+
+    /// The raw pipeline (for fixup-list visibility), gated like everything
+    /// else.
+    fn pipeline_or_skip(test: &str) -> Option<(MetalContext, GpuPipeline)> {
+        match MetalContext::new() {
+            Ok(ctx) => Some((ctx, GpuPipeline::new())),
+            Err(err) => {
+                if std::env::var_os("METAL_JSON_REQUIRE_GPU").is_some_and(|v| v == "1") {
+                    panic!("METAL_JSON_REQUIRE_GPU=1 but no usable Metal device: {err}");
+                }
+                eprintln!("SKIP {test}: no usable Metal device here ({err})");
+                None
+            }
+        }
+    }
+
+    /// Run the raw pipeline; the input must parse. Returns the sorted
+    /// long-string fixup list.
+    fn accepted_fixups(ctx: &MetalContext, pipeline: &GpuPipeline, input: &[u8]) -> Vec<u32> {
+        match pipeline
+            .run(ctx, input, metal_json::parser::DEFAULT_MAX_DEPTH)
+            .expect("GPU plumbing")
+        {
+            GpuParse::Accepted(out) => out.long_string_fixups,
+            GpuParse::Rejected(packed) => panic!(
+                "input must parse, got packed error {:?}",
+                (packed >> 32, packed as u32)
+            ),
+        }
+    }
+
+    /// (a) ~8 MB CLEAN string: the fast-path valve. One lane never owns
+    /// the 8 MB walk; the CPU patch produces reference-identical output.
+    #[test]
+    fn valve_8mb_clean_string_is_bit_exact() {
+        let Some(gpu) = common::gpu_parser_or_skip("valve_8mb_clean_string_is_bit_exact") else {
+            return;
+        };
+        let Some((ctx, pipeline)) = pipeline_or_skip("valve_8mb_clean_string_is_bit_exact")
+        else {
+            return;
+        };
+        let cpu = common::cpu_parser();
+
+        let mut body = String::new();
+        while body.len() < 8 * 1024 * 1024 {
+            body.push_str("abcdefgh é→😀 0123");
+        }
+        let json = format!("\"{body}\"");
+
+        assert_eq!(
+            accepted_fixups(&ctx, &pipeline, json.as_bytes()),
+            vec![0],
+            "an 8MB string MUST take the long-string fixup path"
+        );
+
+        let started = std::time::Instant::now();
+        let gpu_doc = gpu.parse(json.as_bytes()).expect("clean 8MB string parses");
+        eprintln!(
+            "valve_8mb_clean_string: {} raw bytes in {:?} (whole Parser::parse)",
+            body.len(),
+            started.elapsed()
+        );
+        assert_eq!(gpu_doc.root().as_str(), Some(body.as_str()));
+        let cpu_doc = cpu.parse(json.as_bytes()).expect("reference parses");
+        super::assert_tape_and_records_eq(&gpu_doc, &cpu_doc, "8MB clean string");
+    }
+
+    /// (b) ~8 MB HEAVILY-ESCAPED string: the escape valve (the worst case
+    /// of the old thread-per-string cliff). serde_json is the content
+    /// oracle; the reference is the artifact oracle.
+    #[test]
+    fn valve_8mb_heavily_escaped_string_is_bit_exact() {
+        let Some(gpu) =
+            common::gpu_parser_or_skip("valve_8mb_heavily_escaped_string_is_bit_exact")
+        else {
+            return;
+        };
+        let Some((ctx, pipeline)) =
+            pipeline_or_skip("valve_8mb_heavily_escaped_string_is_bit_exact")
+        else {
+            return;
+        };
+        let cpu = common::cpu_parser();
+
+        let piece = format!(
+            "{}{}{}{}{}{}",
+            u_esc("D83D"),
+            u_esc("DE00"),
+            r"\n\t\\",
+            "\\\"", // the \" escape (a raw string cannot hold a quote)
+            u_esc("0000"),
+            r"\/"
+        );
+        let mut body = String::new();
+        while body.len() < 8 * 1024 * 1024 {
+            body.push_str(&piece);
+        }
+        let json = format!("\"{body}\"");
+        let want: String = serde_json::from_str(&json).expect("valid JSON string");
+
+        assert_eq!(
+            accepted_fixups(&ctx, &pipeline, json.as_bytes()),
+            vec![0],
+            "an 8MB escaped string MUST take the long-string fixup path"
+        );
+
+        let started = std::time::Instant::now();
+        let gpu_doc = gpu.parse(json.as_bytes()).expect("escaped 8MB string parses");
+        eprintln!(
+            "valve_8mb_heavily_escaped_string: {} raw bytes in {:?} (whole Parser::parse)",
+            body.len(),
+            started.elapsed()
+        );
+        assert_eq!(gpu_doc.root().as_str(), Some(want.as_str()));
+        let cpu_doc = cpu.parse(json.as_bytes()).expect("reference parses");
+        super::assert_tape_and_records_eq(&gpu_doc, &cpu_doc, "8MB escaped string");
+    }
+
+    /// (c) Long + short strings + numbers in one document: offsets and
+    /// gaps stay correct around the CPU-patched records (whole-tape +
+    /// whole-record bit-match against the reference).
+    #[test]
+    fn valve_mixed_document_keeps_offsets_and_gaps_correct() {
+        let Some(gpu) =
+            common::gpu_parser_or_skip("valve_mixed_document_keeps_offsets_and_gaps_correct")
+        else {
+            return;
+        };
+        let Some((ctx, pipeline)) =
+            pipeline_or_skip("valve_mixed_document_keeps_offsets_and_gaps_correct")
+        else {
+            return;
+        };
+        let cpu = common::cpu_parser();
+
+        let t = LONG_STRING_THRESHOLD as usize;
+        let long_clean = "x".repeat(4 * t);
+        let long_escaped = format!("{}tail", r"\t".repeat(t)); // raw 2t + 4, shrinks to t + 4
+        let json = format!(
+            r#"{{"a":"short","b":"{long_clean}","n":[1,2.5e10,"{long_escaped}"],"z":"k\n"}}"#
+        );
+
+        // Document string order: "a", "short", "b", long_clean, "n",
+        // long_escaped, "z", "k\n" — exactly the two long ones flagged.
+        assert_eq!(
+            accepted_fixups(&ctx, &pipeline, json.as_bytes()),
+            vec![3, 5],
+            "exactly the two long strings take the fixup path"
+        );
+
+        diff_backends(&gpu, &cpu, json.as_bytes(), "mixed long/short document");
+        let doc = gpu.parse(json.as_bytes()).expect("mixed document parses");
+        let root = doc.root();
+        assert_eq!(root.get("a").unwrap().as_str(), Some("short"));
+        assert_eq!(root.get("b").unwrap().as_str(), Some(long_clean.as_str()));
+        let n = root.get("n").unwrap();
+        assert_eq!(n.at(0).unwrap().as_i64(), Some(1));
+        assert_eq!(n.at(1).unwrap().as_f64(), Some(2.5e10));
+        let want_escaped = format!("{}tail", "\t".repeat(t));
+        assert_eq!(n.at(2).unwrap().as_str(), Some(want_escaped.as_str()));
+        assert_eq!(root.get("z").unwrap().as_str(), Some("k\n"));
+    }
+
+    /// (d) A long string whose escape ERROR sits past the threshold: the
+    /// CPU patch pass rejects with the reference's exact (offset, kind).
+    #[test]
+    fn valve_long_string_error_rejects_at_the_reference_offset() {
+        let Some(gpu) =
+            common::gpu_parser_or_skip("valve_long_string_error_rejects_at_the_reference_offset")
+        else {
+            return;
+        };
+        let cpu = common::cpu_parser();
+
+        let n = LONG_STRING_THRESHOLD as usize + 1234;
+        let json = format!("[\"ok\",\"{}{}b\"]", "a".repeat(n), r"\q");
+        // Backslash absolute offset: `["ok","` is 7 bytes, then n `a`s.
+        let want_offset = 7 + n as u64;
+        match gpu.parse(json.as_bytes()) {
+            Err(Error::Syntax { offset, kind }) => {
+                assert_eq!(kind, SyntaxErrorKind::InvalidStringEscape);
+                assert_eq!(offset, want_offset, "CPU-side rejection at the backslash");
+            }
+            other => panic!("expected InvalidStringEscape, got {other:?}"),
+        }
+        // Reference parity: single-error document, code AND offset.
+        let gpu_err = gpu.parse(json.as_bytes()).expect_err("rejects on GPU");
+        let cpu_err = cpu.parse(json.as_bytes()).expect_err("rejects on reference");
+        assert_eq!(format!("{gpu_err:?}"), format!("{cpu_err:?}"));
+    }
+
+    /// (e) The threshold boundary through the full pipeline: raw_len ==
+    /// threshold stays on the GPU, threshold + 1 takes the valve; both
+    /// bit-match the reference.
+    #[test]
+    fn valve_threshold_boundary_routes_and_bit_matches() {
+        let Some(gpu) =
+            common::gpu_parser_or_skip("valve_threshold_boundary_routes_and_bit_matches")
+        else {
+            return;
+        };
+        let Some((ctx, pipeline)) =
+            pipeline_or_skip("valve_threshold_boundary_routes_and_bit_matches")
+        else {
+            return;
+        };
+        let cpu = common::cpu_parser();
+
+        let at = LONG_STRING_THRESHOLD as usize;
+        let exact = format!("\"{}\"", "a".repeat(at));
+        assert!(
+            accepted_fixups(&ctx, &pipeline, exact.as_bytes()).is_empty(),
+            "raw_len == threshold stays on the GPU"
+        );
+        diff_backends(&gpu, &cpu, exact.as_bytes(), "exactly at threshold");
+
+        let over = format!("\"{}\"", "a".repeat(at + 1));
+        assert_eq!(
+            accepted_fixups(&ctx, &pipeline, over.as_bytes()),
+            vec![0],
+            "raw_len == threshold + 1 takes the valve"
+        );
+        diff_backends(&gpu, &cpu, over.as_bytes(), "one over threshold");
+    }
+}
+
+// --- 7. Manual timing prints (informational only; M5 owns perf) --------------------
 
 /// Deterministic single-line synthetic document of at least `target`
 /// bytes (the tests/kernels.rs / tests/structure.rs generator shape):

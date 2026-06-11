@@ -1,15 +1,30 @@
 //! `Parser`: the reusable entry point.
 //!
 //! From M4 on the default backend is the **Metal GPU pipeline**
-//! ([`Backend::Gpu`]): [`Parser::new`] acquires the system default Metal
-//! device once (failing gracefully with [`Error::NoDevice`] on machines
-//! without one — gate tests the `ctx_or_skip` way) and every
+//! ([`Backend::Gpu`]) on every machine that has a usable Metal device:
+//! [`Parser::new`] acquires the system default device once and every
 //! [`Parser::parse`] drives the full CB1→CB2→CB3 pipeline in
 //! [`crate::gpu::pipeline`], building a [`Document`] from the finished
-//! tape/string buffers. The scalar CPU oracle (`Backend::CpuReference`,
-//! behind the `cpu-reference` feature) remains available by explicit
-//! selection — it is the bit-exact reference the GPU backend is diffed
-//! against, not a fallback.
+//! tape/string buffers.
+//!
+//! # Default-backend policy (pinned by `default_backend_policy` below)
+//!
+//! [`Backend::default`] — and therefore [`ParserOptions::default`], i.e.
+//! the selection happens at **options-construction time**, via a cached
+//! one-per-process device probe — resolves to:
+//!
+//! 1. [`Backend::Gpu`] when a Metal device is creatable on this machine;
+//! 2. else `Backend::CpuReference` when the `cpu-reference` feature is
+//!    compiled in (the scalar oracle parses correctly anywhere — an
+//!    ergonomic default for non-Metal hosts, M1 parity);
+//! 3. else [`Backend::Gpu`] anyway, so [`Parser::new`] surfaces a clear
+//!    [`Error::NoDevice`].
+//!
+//! An **explicitly selected** `Backend::Gpu` is GPU-strict: construction
+//! fails with [`Error::NoDevice`] rather than silently falling back — an
+//! explicit choice is never second-guessed (and the reference backend
+//! stays what it is: the bit-exact oracle the GPU is diffed against, not
+//! a runtime escape hatch).
 //!
 //! Still to come (M5): the buffer pool, the zero-copy input paths
 //! (`alloc_input` / `parse_aligned`, mmap-backed `parse_file`) and
@@ -19,6 +34,7 @@
 
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use crate::document::Document;
 use crate::error::Result;
@@ -37,9 +53,11 @@ pub const DEFAULT_MAX_DEPTH: u32 = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Backend {
-    /// The Metal GPU pipeline (the default). Construction requires a Metal
-    /// device: [`Parser::with_options`] returns [`Error::NoDevice`] (or
-    /// another device/library error) when none is usable.
+    /// The Metal GPU pipeline (the default whenever a device exists).
+    /// Construction requires a Metal device: [`Parser::with_options`]
+    /// returns [`Error::NoDevice`] (or another device/library error) when
+    /// none is usable — explicit selection is GPU-strict, never silently
+    /// downgraded (see the module-level default-backend policy).
     Gpu,
     /// The scalar CPU oracle pipeline — produces the bit-identical target
     /// tape and is the correctness reference the GPU pipeline is diffed
@@ -48,12 +66,39 @@ pub enum Backend {
     CpuReference,
 }
 
-/// [`Backend::Gpu`] — the GPU pipeline is complete as of M4 and is the
-/// point of the crate. `Backend::CpuReference` (feature `cpu-reference`)
-/// must be selected explicitly.
+/// Whether a usable Metal device exists on this machine. Probed at most
+/// once per process (a throwaway [`MetalContext`] is created and dropped;
+/// the result is cached in a `OnceLock`), so calling
+/// [`ParserOptions::default`] repeatedly stays cheap.
+fn metal_device_available() -> bool {
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| MetalContext::new().is_ok())
+}
+
+/// The default-backend policy with the device probe injected — separated
+/// from [`metal_device_available`] so the probed-false branch is unit
+/// testable on machines that do have a GPU. See the module docs for the
+/// policy's rationale.
+fn resolve_default_backend(gpu_available: bool) -> Backend {
+    if !gpu_available {
+        #[cfg(feature = "cpu-reference")]
+        return Backend::CpuReference;
+    }
+    // A device is available — or there is no CPU oracle compiled in, in
+    // which case Gpu is still the default and Parser construction surfaces
+    // a clear Error::NoDevice.
+    Backend::Gpu
+}
+
+/// The module-level default-backend policy: [`Backend::Gpu`] when a Metal
+/// device is creatable on this machine (cached one-shot probe), else
+/// `Backend::CpuReference` when the `cpu-reference` feature is enabled,
+/// else [`Backend::Gpu`] (which surfaces [`Error::NoDevice`]). Resolution
+/// happens here — i.e. at [`ParserOptions::default`] time, not at parse
+/// time.
 impl Default for Backend {
     fn default() -> Self {
-        Self::Gpu
+        resolve_default_backend(metal_device_available())
     }
 }
 
@@ -76,7 +121,9 @@ pub struct ParserOptions {
     /// [`Error::DepthLimit`]. Defaults to [`DEFAULT_MAX_DEPTH`] (1024,
     /// simdjson parity).
     pub max_depth: u32,
-    /// Backend selection; defaults to [`Backend::Gpu`].
+    /// Backend selection; defaults to [`Backend::default`] (the documented
+    /// device-probe policy — [`Backend::Gpu`] whenever this machine has a
+    /// Metal device).
     pub backend: Backend,
 }
 
@@ -115,14 +162,16 @@ pub struct Parser {
 }
 
 impl Parser {
-    /// Create a parser with default options ([`Backend::Gpu`]).
+    /// Create a parser with default options (the [`Backend::default`]
+    /// policy: GPU when a Metal device exists, the CPU oracle when it does
+    /// not and `cpu-reference` is compiled in).
     ///
     /// # Errors
     ///
-    /// [`Error::NoDevice`] when no Metal device is usable (plus the other
-    /// device/library construction failures). There is no implicit CPU
-    /// fallback; select `Backend::CpuReference` explicitly if that is
-    /// what you want.
+    /// [`Error::NoDevice`] when no Metal device is usable and no CPU
+    /// fallback is compiled in (plus the other device/library construction
+    /// failures). An explicit `Backend::Gpu` in [`Parser::with_options`]
+    /// is never downgraded — only the *default* selection probes.
     pub fn new() -> Result<Self> {
         Self::with_options(ParserOptions::default())
     }
@@ -231,9 +280,75 @@ mod tests {
     fn default_options() {
         let opts = ParserOptions::default();
         assert_eq!(opts.max_depth, 1024);
-        // M4 on: the GPU pipeline is the unconditional default backend.
-        assert_eq!(opts.backend, Backend::Gpu);
-        assert_eq!(Backend::default(), Backend::Gpu);
+        // Backend selection happens at options-default time, per the
+        // pinned policy (default_backend_policy below).
+        assert_eq!(opts.backend, Backend::default());
+    }
+
+    /// THE default-backend policy pin, with **no silent skips**: the
+    /// resolution function is asserted for both probe outcomes (the
+    /// probed-false branch injected — faking device absence end-to-end is
+    /// not attempted), and the live default is asserted to follow whatever
+    /// the real probe says, including a working end-to-end parse.
+    #[test]
+    fn default_backend_policy() {
+        // Probe injected: a machine with a device always defaults to Gpu.
+        assert_eq!(resolve_default_backend(true), Backend::Gpu);
+        // Probe injected: no device falls back to the CPU oracle when it
+        // is compiled in, else stays Gpu (surfacing NoDevice clearly).
+        #[cfg(feature = "cpu-reference")]
+        assert_eq!(resolve_default_backend(false), Backend::CpuReference);
+        #[cfg(not(feature = "cpu-reference"))]
+        assert_eq!(resolve_default_backend(false), Backend::Gpu);
+
+        // The live default follows the real probe — asserted on BOTH
+        // probe outcomes (no early return).
+        if metal_device_available() {
+            assert_eq!(Backend::default(), Backend::Gpu);
+            let parser = Parser::new().expect("probe says a device exists");
+            assert_eq!(parser.options().backend, Backend::Gpu);
+            let doc = parser.parse(b"[1,2]").expect("default backend parses");
+            assert_eq!(doc.root().len(), Some(2));
+        } else {
+            if std::env::var_os("METAL_JSON_REQUIRE_GPU").is_some_and(|v| v == "1") {
+                panic!("METAL_JSON_REQUIRE_GPU=1 but the device probe failed");
+            }
+            assert_eq!(Backend::default(), resolve_default_backend(false));
+            #[cfg(feature = "cpu-reference")]
+            {
+                let parser =
+                    Parser::new().expect("CpuReference default construction is infallible");
+                assert_eq!(parser.options().backend, Backend::CpuReference);
+                let doc = parser.parse(b"[1,2]").expect("fallback backend parses");
+                assert_eq!(doc.root().len(), Some(2));
+            }
+        }
+    }
+
+    /// Explicit `Backend::Gpu` is GPU-strict: whatever the default policy
+    /// does, explicitly selecting the GPU must construct iff a device
+    /// exists (no silent fallback in either direction).
+    #[test]
+    fn explicit_gpu_backend_is_never_second_guessed() {
+        let opts = ParserOptions {
+            backend: Backend::Gpu,
+            ..ParserOptions::default()
+        };
+        match Parser::with_options(opts) {
+            Ok(parser) => {
+                assert!(
+                    metal_device_available(),
+                    "explicit Gpu constructed without a device?"
+                );
+                assert_eq!(parser.options().backend, Backend::Gpu);
+            }
+            Err(err) => {
+                assert!(
+                    !metal_device_available(),
+                    "explicit Gpu failed despite a usable device: {err}"
+                );
+            }
+        }
     }
 
     #[test]

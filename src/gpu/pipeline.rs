@@ -24,16 +24,19 @@
 //!                            → K13 root words → error fold
 //!                            (Stage3::encode_structure — see gpu::stage3)
 //!      [string kernels]      string_total > 0 only: record offsets → K11
-//!                            unescape (records + `"` tape words) → error
-//!                            fold (see gpu::strings for the kernel
-//!                            contract and the thread-per-string perf
-//!                            cliff note)
+//!                            unescape (records + `"` tape words; strings
+//!                            over the long-string threshold → fixup list)
+//!                            → error fold (see gpu::strings for the
+//!                            kernel contract and the long-string valve)
 //!      [number kernel]       scalar_total > 0 only: K10 numbers/literals
 //!                            (l/u/d two-word + t/f/n one-word entries,
 //!                            hard cases → fixup list; see gpu::numbers)
 //!   ── commit, wait: CPU sync 3 reads the merged verdict, then patches
 //!      the fixup-listed value words in the shared tape buffer via
-//!      patch_number_fixups (re-parsing those few scalars on the CPU) ──
+//!      patch_number_fixups (re-parsing those few scalars on the CPU) and
+//!      the fixup-listed long strings via patch_long_strings (re-running
+//!      the shared reference unescaper into the precomputed record slots
+//!      of the shared string buffer + their `"` tape words) ──
 //! ```
 //!
 //! All three CB3 blocks consume only stage-1/2 outputs (token stream,
@@ -54,7 +57,9 @@
 //!   K11's string fold (both folds reuse `structure_finalize`, which
 //!   min-folds on top of the header);
 //! - K10's 32-bit offset cell, packed with `MJ_ERR_NUMBER` on the CPU;
-//! - rejections from the fixup re-parse (overflow-to-infinity).
+//! - rejections from the number-fixup re-parse (overflow-to-infinity);
+//! - rejections from the long-string-fixup re-parse (escape / control
+//!   errors past the K11 threshold, at reference-exact offsets).
 //!
 //! On single-error documents this equals the reference verdict (code AND
 //! offset, with the documented odd-quote offset exception). On multi-error
@@ -89,6 +94,7 @@ use crate::stage::{Stage, Stage1Buffers, Stage3Buffers, sort_passes};
 use crate::tape::{make_final_root, make_root};
 
 use super::numbers::{NO_NUMBER_ERROR, pack_number_error, patch_number_fixups};
+use super::strings::patch_long_strings;
 use super::stage2::{Stage2Accepted, Stage2Run};
 use super::stage3::{Stage3, StructureDims};
 use super::{
@@ -129,6 +135,10 @@ pub struct GpuParseOutput {
     /// Token indices that took the K10 hard-case fixup path, sorted
     /// ascending (diagnostic; the value words are already patched).
     pub fixup_tokens: Vec<u32>,
+    /// String-list indices that took the K11 long-string fixup path
+    /// (`raw_len > LONG_STRING_THRESHOLD`), sorted ascending (diagnostic;
+    /// the records and tape words are already patched).
+    pub long_string_fixups: Vec<u32>,
 }
 
 /// K11's CB3 buffers (sizes known at CPU sync 2).
@@ -136,6 +146,12 @@ struct StringBuffers {
     record_offsets: GpuBuffer,
     stringbuf: GpuBuffer,
     chunk_error: GpuBuffer,
+    /// Long-string fixup append counter (device atomic, armed with 0).
+    long_count: GpuBuffer,
+    /// The long-string fixup index list, sized from the string count
+    /// (worst case every string is long) — acceptable because entries are
+    /// index-sized u32s, 4 bytes per string, never content-sized.
+    long_list: GpuBuffer,
     chunks: usize,
 }
 
@@ -252,10 +268,17 @@ impl GpuPipeline {
             // drop the fill).
             let mut stringbuf = GpuBuffer::alloc(ctx, stringbuf_total)?;
             stringbuf.contents_mut().fill(0);
+            // The long-string append counter gets its precondition
+            // established explicitly (GpuBuffer::alloc makes no contents
+            // guarantee), like K10's fixup counter below.
+            let mut long_count = GpuBuffer::alloc(ctx, size_of::<u32>())?;
+            long_count.as_mut_slice::<u32>()[0] = 0;
             Some(StringBuffers {
                 record_offsets: GpuBuffer::alloc(ctx, string_total * size_of::<u64>())?,
                 stringbuf,
                 chunk_error: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
+                long_count,
+                long_list: GpuBuffer::alloc(ctx, string_total * size_of::<u32>())?,
                 chunks,
             })
         } else {
@@ -313,6 +336,8 @@ impl GpuPipeline {
                 let h_offsets = batch.bind_write(&mut sb.record_offsets);
                 let h_sbuf = batch.bind_write(&mut sb.stringbuf);
                 let h_serr = batch.bind_write(&mut sb.chunk_error);
+                let h_lcount = batch.bind_write(&mut sb.long_count);
+                let h_llist = batch.bind_write(&mut sb.long_list);
 
                 let token_params = MjParams {
                     input_len,
@@ -335,6 +360,7 @@ impl GpuPipeline {
                     &mut batch,
                     &[
                         h_input, h_pos, h_strings, h_offsets, h_tape_ofs, h_sbuf, h_tape, h_serr,
+                        h_lcount, h_llist,
                     ],
                     Some(&string_params),
                     Dispatch::Threadgroups(sb.chunks),
@@ -378,11 +404,44 @@ impl GpuPipeline {
             batch.commit_and_wait()?;
         }
 
-        // --- CPU sync 3: merged verdict + fixup patch ------------------------
+        // --- CPU sync 3: merged verdict + fixup patches ----------------------
         let header = bufs1.read_header();
         let mut error: Option<u64> = header.first_error().map(|(o, c)| (o << 32) | u64::from(c));
         fn merge(packed: u64, error: &mut Option<u64>) {
             *error = Some(error.map_or(packed, |e| e.min(packed)));
+        }
+
+        // The K11 long-string patch: re-run the flagged strings through the
+        // shared reference unescaper into their precomputed slots of the
+        // shared string buffer (+ their `"` tape words). Done even when an
+        // error is already known — a long string can reject at an EARLIER
+        // offset, and the merged verdict is the packed minimum.
+        let mut long_string_fixups = Vec::new();
+        if let Some(sb) = string_bufs.as_mut() {
+            // Kernel appends at most once per thread.
+            let total = (sb.long_count.as_slice::<u32>()[0] as usize).min(string_total);
+            long_string_fixups = sb.long_list.as_slice::<u32>()[..total].to_vec();
+            long_string_fixups.sort_unstable();
+            if let Some(patch_error) = patch_long_strings(
+                input,
+                bufs1
+                    .tok_pos
+                    .as_ref()
+                    .expect("tokens allocated")
+                    .as_slice::<u32>(),
+                bufs2
+                    .string_tokens
+                    .as_ref()
+                    .expect("lists allocated")
+                    .as_slice::<u32>(),
+                sb.record_offsets.as_slice::<u64>(),
+                bufs2.tape_ofs.as_slice::<u32>(),
+                &long_string_fixups,
+                sb.stringbuf.contents_mut(),
+                tape_buf.as_mut_slice::<u64>(),
+            ) {
+                merge(patch_error, &mut error);
+            }
         }
 
         let mut fixup_tokens = Vec::new();
@@ -421,6 +480,7 @@ impl GpuPipeline {
             tape: tape_buf,
             stringbuf: string_bufs.map(|sb| sb.stringbuf),
             fixup_tokens,
+            long_string_fixups,
         }))
     }
 }

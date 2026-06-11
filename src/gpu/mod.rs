@@ -47,5 +47,6 @@ pub use stage3::{
     ERR_DEPTH_LIMIT, ERR_TRAILING_CONTENT, NO_MATCH, Stage3, Stage3Output, run_stage3,
 };
 pub use strings::{
-    ERR_STRING_CONTROL, ERR_STRING_ESCAPE, StringsOutput, StringsStage, run_strings,
+    ERR_STRING_CONTROL, ERR_STRING_ESCAPE, LONG_STRING_THRESHOLD, StringsOutput, StringsStage,
+    patch_long_strings, run_strings,
 };

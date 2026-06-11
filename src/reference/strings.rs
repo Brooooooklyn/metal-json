@@ -37,6 +37,10 @@
 use super::tokens::{Token, TokenKind};
 use crate::error::{Error, Result, SyntaxErrorKind};
 use crate::tape::{STRING_RECORD_HEADER_BYTES, STRING_RECORD_TRAILER_BYTES};
+// The single shared unescaper (src/unescape.rs): also the CPU half of the
+// GPU long-string valve (`gpu::strings::patch_long_strings`), which is why
+// it lives outside this feature-gated module.
+use crate::unescape::unescape;
 
 /// One unescaped string, tagged with its `QuoteOpen` token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,108 +95,6 @@ pub fn stage6_strings(tokens: &[Token], input: &[u8]) -> Result<Vec<UnescapedStr
             record_offset,
             raw_len: u32::try_from(raw.len()).expect("string longer than u32::MAX bytes"),
         });
-    }
-    Ok(out)
-}
-
-/// Read 4 hex digits (case-insensitive) at `raw[at..at+4]`.
-fn hex4(raw: &[u8], at: usize) -> Option<u32> {
-    if at + 4 > raw.len() {
-        return None;
-    }
-    let mut value = 0u32;
-    for &b in &raw[at..at + 4] {
-        value = value * 16 + (b as char).to_digit(16)?;
-    }
-    Some(value)
-}
-
-/// Unescape one raw string body. `base` is the absolute offset of `raw[0]`
-/// in the input, for error reporting; escape errors point at the backslash.
-fn unescape(raw: &[u8], base: u32) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0usize;
-    while i < raw.len() {
-        let b = raw[i];
-        if b < 0x20 {
-            // Raw control characters must be escaped (kills
-            // n_string_unescaped_tab.json / _newline / _ctrl_char).
-            return Err(Error::Syntax {
-                offset: u64::from(base) + i as u64,
-                kind: SyntaxErrorKind::ControlCharacterInString,
-            });
-        }
-        if b != b'\\' {
-            // UTF-8 continuation bytes were validated in stage 1; copy
-            // verbatim. (An unescaped `"` cannot appear: the extent ends at
-            // the first unescaped quote.)
-            out.push(b);
-            i += 1;
-            continue;
-        }
-
-        let escape_error = || Error::Syntax {
-            offset: u64::from(base) + i as u64,
-            kind: SyntaxErrorKind::InvalidStringEscape,
-        };
-        // A trailing lone backslash cannot occur via stages 1-3 (it would
-        // have escaped the closing quote), but stay graceful for direct use.
-        let designator = *raw.get(i + 1).ok_or_else(escape_error)?;
-        match designator {
-            b'"' | b'\\' | b'/' => {
-                out.push(designator);
-                i += 2;
-            }
-            b'b' => {
-                out.push(0x08);
-                i += 2;
-            }
-            b'f' => {
-                out.push(0x0C);
-                i += 2;
-            }
-            b'n' => {
-                out.push(0x0A);
-                i += 2;
-            }
-            b'r' => {
-                out.push(0x0D);
-                i += 2;
-            }
-            b't' => {
-                out.push(0x09);
-                i += 2;
-            }
-            b'u' => {
-                let first = hex4(raw, i + 2).ok_or_else(escape_error)?;
-                let (code_point, consumed) = match first {
-                    0xD800..=0xDBFF => {
-                        // High surrogate: must be chased by a low-surrogate
-                        // escape (kills n_string_incomplete_surrogate.json
-                        // and n_string_1_surrogate_then_escape_u1.json).
-                        if raw.get(i + 6) != Some(&b'\\') || raw.get(i + 7) != Some(&b'u') {
-                            return Err(escape_error());
-                        }
-                        let low = hex4(raw, i + 8).ok_or_else(escape_error)?;
-                        if !(0xDC00..=0xDFFF).contains(&low) {
-                            return Err(escape_error());
-                        }
-                        (0x10000 + ((first - 0xD800) << 10) + (low - 0xDC00), 12)
-                    }
-                    // Lone / inverted low surrogate.
-                    0xDC00..=0xDFFF => return Err(escape_error()),
-                    _ => (first, 6),
-                };
-                let ch = char::from_u32(code_point)
-                    .expect("surrogate-free code point <= U+10FFFF is a valid char");
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                i += consumed;
-            }
-            // Unknown escapes (kills n_string_escape_x.json,
-            // n_string_backslash_00.json, n_string_escaped_emoji.json).
-            _ => return Err(escape_error()),
-        }
     }
     Ok(out)
 }

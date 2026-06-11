@@ -19,12 +19,17 @@ crossover point documented honestly.
 Working today:
 
 - **The full GPU parser**: `Parser::new()?` (acquires the Metal device;
-  `Backend::Gpu` is the default) → `parser.parse(&bytes)?` → `Document` /
-  `Value` navigation. All 13 kernels (classify/escape/UTF-8 → scans → token
+  `Backend::Gpu` is the default whenever the machine has one — without a
+  device the default resolves to the `cpu-reference` oracle when that
+  feature is compiled in, while an *explicit* `Backend::Gpu` is never
+  second-guessed) → `parser.parse(&bytes)?` → `Document` / `Value`
+  navigation. All 13 kernels (classify/escape/UTF-8 → scans → token
   scatter → validation/footprints → depth sort → bracket pairing →
   container tape words → number parse with Eisel-Lemire f64 bit patterns +
-  CPU fixups for the hard roundings → string validation/unescape) across 3
-  command buffers with exact-size allocations at each CPU sync.
+  CPU fixups for the hard roundings → string validation/unescape, with the
+  same CPU-fixup valve for rare >16 KiB strings so one giant string never
+  serializes a parse on a single GPU lane) across 3 command buffers with
+  exact-size allocations at each CPU sync.
 - Every error class at reference parity (JSONTestSuite 318/318 two-way vs
   the scalar `cpu-reference` oracle, which remains available as an explicit
   backend behind the `cpu-reference` feature).

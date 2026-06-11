@@ -10,7 +10,10 @@
 //! [`Parser`] parses real documents on the GPU by default: `Parser::new()`
 //! acquires the Metal device and [`Parser::parse`] drives the full
 //! CB1→CB2→CB3 pipeline ([`gpu::GpuPipeline`]) to a complete
-//! tape-format-v1 [`Document`]. What exists today: the build pipeline (AOT
+//! tape-format-v1 [`Document`]. (On machines without a Metal device the
+//! *default* backend resolves to the CPU oracle when `cpu-reference` is
+//! compiled in — see [`parser`]'s documented default-backend policy;
+//! explicit `Backend::Gpu` stays GPU-strict.) What exists today: the build pipeline (AOT
 //! `.metal` → metallib in build.rs, or runtime MSL compilation behind the
 //! `runtime-shaders` feature), the safe wrapper layer over `objc2-metal`
 //! in [`metal`] (including multi-dispatch [`metal::CommandBatch`]
@@ -41,10 +44,12 @@
 //! - `runtime-shaders` — compile MSL at runtime instead of embedding an
 //!   AOT-built metallib; honors `METAL_JSON_SHADER_DIR` for hot reload.
 //!   Also the fallback for machines without the Xcode Metal toolchain.
-//! - `cpu-reference` — scalar CPU oracle backend (M1).
+//! - `cpu-reference` — scalar CPU oracle backend (M1); when enabled it is
+//!   also the *default*-backend fallback on machines without Metal.
 //! - `timing` — per-kernel GPU timing via `MTLCounterSampleBuffer` (M5).
 
 mod error;
+mod unescape;
 
 pub mod document;
 pub mod gpu;

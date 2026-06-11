@@ -55,12 +55,21 @@
 //! conveniently-zero fresh pages. (The CPU reference zero-fills gaps
 //! instead — its output is deterministic by design.)
 //!
-//! # Known perf cliff (v1, documented decision)
+//! # The long-string valve (the K10 fixup pattern, applied to K11)
 //!
-//! K11 is thread-per-string: one multi-KB escaped string serializes on a
-//! single lane. Acceptable for M4 correctness; the threadgroup-per-string
-//! valve, if M5 profiling demands it, goes in `shaders/13_strings.metal`
-//! (see the header comment there for the exact shape).
+//! K11 is thread-per-string: without a valve one multi-MB string would
+//! serialize the whole parse on a single lane (latency, potential
+//! command-buffer timeout). Strings with `raw_len >`
+//! [`LONG_STRING_THRESHOLD`] are therefore not unescaped on the GPU: the
+//! kernel appends their string-list index to a long-string fixup list via
+//! a device atomic counter, and after the command buffer completes
+//! [`patch_long_strings`] re-runs exactly those strings through the shared
+//! reference unescaper (`crate::unescape`), writing each record into the
+//! string buffer at its precomputed offset and the `"` tape word at
+//! `tape_ofs[token]` — composable on the CPU because record offsets are
+//! pure token-position math (`raw_len + 5` prefix sums), independent of
+//! content. Unescape errors from flagged strings merge into the packed
+//! first-error fold exactly like fixup-driven number rejections.
 //!
 //! # Error contract
 //!
@@ -75,10 +84,10 @@
 //! - [`ERR_STRING_CONTROL`] — `SyntaxErrorKind::ControlCharacterInString`,
 //!   at the raw control byte (< 0x20).
 
-use crate::error::Result;
+use crate::error::{Error, Result, SyntaxErrorKind};
 use crate::metal::{Dispatch, GpuBuffer, MetalContext, MjParams, THREADGROUP_SIZE};
 use crate::stage::{Stage, Stage1Buffers};
-use crate::tape::STRING_RECORD_HEADER_BYTES;
+use crate::tape::{STRING_RECORD_HEADER_BYTES, make_string};
 
 use super::stage2::{Stage2, Stage2Accepted, Stage2Output, Stage2Run};
 
@@ -96,6 +105,17 @@ pub const ERR_STRING_ESCAPE: u32 = 23;
 /// `MjErrorCode` value for `SyntaxErrorKind::ControlCharacterInString`.
 /// See [`ERR_STRING_ESCAPE`].
 pub const ERR_STRING_CONTROL: u32 = 24;
+
+/// The long-string valve threshold, in raw bytes between the quotes:
+/// strings with `raw_len` STRICTLY ABOVE this are deferred to the CPU
+/// patch pass ([`patch_long_strings`]) instead of being walked by one GPU
+/// thread. 16384 (one 16 KiB page) is long enough that real-world strings
+/// almost never cross it — the GPU keeps the whole hot path — yet short
+/// enough that a single K11 lane never owns more than one page-sized walk
+/// (never megabytes), bounding the kernel's serial tail. Mirrors
+/// `MJ_LONG_STRING_THRESHOLD` in `shaders/13_strings.metal` — keep in sync
+/// (a test parses the shader and pins both).
+pub const LONG_STRING_THRESHOLD: u32 = 16384;
 
 /// Pre-fill byte for the GPU string buffer (see the module docs: gap bytes
 /// are unspecified, and poison keeps "kernel forgot to write" failures
@@ -137,6 +157,12 @@ pub struct StringsOutput {
     /// everywhere else (container/root/scalar words belong to K12/K13/K10,
     /// which this standalone runner does not dispatch).
     pub tape: Vec<u64>,
+    /// String-list indices that took the long-string fixup path
+    /// (`raw_len > LONG_STRING_THRESHOLD`), sorted ascending (the GPU
+    /// appends in nondeterministic order; the runner sorts). Reported on
+    /// rejected runs too (diagnostic: which strings the CPU re-ran),
+    /// mirroring `NumbersOutput::fixup_tokens`.
+    pub long_string_fixups: Vec<u32>,
     /// First error, packed `(byte_offset << 32) | code`, or `None`. Codes:
     /// everything stage 2 can report, plus [`ERR_STRING_ESCAPE`] and
     /// [`ERR_STRING_CONTROL`].
@@ -290,6 +316,15 @@ impl StringsStage {
         stringbuf.contents_mut().fill(STRINGBUF_POISON); // see the module docs
         let str_chunks = string_total.div_ceil(THREADGROUP_SIZE);
         let mut chunk_error = GpuBuffer::alloc(ctx, str_chunks * size_of::<u64>())?;
+        // The long-string fixup list (K10's fixup plumbing, mirrored).
+        // Accumulation targets get their preconditions established
+        // explicitly (GpuBuffer::alloc makes no contents guarantee).
+        let mut long_count = GpuBuffer::alloc(ctx, size_of::<u32>())?;
+        long_count.as_mut_slice::<u32>()[0] = 0;
+        // Worst case every string is long, so size from the string count —
+        // acceptable because entries are index-sized u32s (4 bytes per
+        // string), never content-sized.
+        let mut long_list = GpuBuffer::alloc(ctx, string_total * size_of::<u32>())?;
 
         let input_len = bufs1.input_len() as u64;
         let tok_chunks = bufs2.chunks();
@@ -326,6 +361,8 @@ impl StringsStage {
             let h_sb = batch.bind_write(&mut stringbuf);
             let h_tape = batch.bind_write(&mut tape_buf);
             let h_err = batch.bind_write(&mut chunk_error);
+            let h_lcount = batch.bind_write(&mut long_count);
+            let h_llist = batch.bind_write(&mut long_list);
             let h_header = batch.bind_write(&mut bufs1.header);
 
             self.offsets.encode(
@@ -338,6 +375,7 @@ impl StringsStage {
                 &mut batch,
                 &[
                     h_input, h_pos, h_strings, h_offsets, h_tape_ofs, h_sb, h_tape, h_err,
+                    h_lcount, h_llist,
                 ],
                 Some(&string_params),
                 Dispatch::Threadgroups(str_chunks),
@@ -351,13 +389,51 @@ impl StringsStage {
             batch.commit_and_wait()?;
         }
 
-        // --- CPU sync: the K11 verdict ----------------------------------------
+        // --- CPU sync: long-string patch + the merged K11 verdict ------------
+        // Kernel appends at most once per thread.
+        let long_total = (long_count.as_slice::<u32>()[0] as usize).min(string_total);
+        let mut long_string_fixups = long_list.as_slice::<u32>()[..long_total].to_vec();
+        long_string_fixups.sort_unstable();
+
+        // Patch the flagged records/tape words in the SHARED buffers in
+        // place (the production flow: CPU-visible after the wait). Done
+        // even when the GPU already found an error: a long string can
+        // reject at an EARLIER offset, and the merged verdict is the
+        // packed minimum — string extents are disjoint, so the minimum is
+        // the reference's document-order-first verdict.
+        let raw_input_len = bufs1.input_len();
+        let patch_error = patch_long_strings(
+            &bufs1.input.contents()[..raw_input_len],
+            bufs1
+                .tok_pos
+                .as_ref()
+                .expect("stage 2 allocated tokens")
+                .as_slice::<u32>(),
+            bufs2
+                .string_tokens
+                .as_ref()
+                .expect("lists allocated")
+                .as_slice::<u32>(),
+            record_offsets.as_slice::<u64>(),
+            bufs2.tape_ofs.as_slice::<u32>(),
+            &long_string_fixups,
+            stringbuf.contents_mut(),
+            tape_buf.as_mut_slice::<u64>(),
+        );
+
         let header = bufs1.read_header();
-        if let Some((offset, code)) = header.first_error() {
+        let header_error = header.first_error().map(|(o, c)| (o << 32) | u64::from(c));
+        let error = match (header_error, patch_error) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(packed) = error {
             // String rejection: stage 2 accepted the input (its outputs are
-            // kept), the string outputs are never produced.
-            let packed = (offset << 32) | u64::from(code);
-            return Ok(StringsOutput::rejected(stage2_out, packed));
+            // kept), the string outputs are never produced. The fixup list
+            // stays reported (diagnostic).
+            let mut out = StringsOutput::rejected(stage2_out, packed);
+            out.long_string_fixups = long_string_fixups;
+            return Ok(out);
         }
 
         Ok(StringsOutput {
@@ -365,6 +441,7 @@ impl StringsStage {
             record_offsets: record_offsets.as_slice::<u64>().to_vec(),
             stringbuf: stringbuf.contents().to_vec(),
             tape: tape_buf.as_slice::<u64>().to_vec(),
+            long_string_fixups,
             error: None,
         })
     }
@@ -384,6 +461,81 @@ impl Default for StringsStage {
 /// As [`StringsStage::run`].
 pub fn run_strings(ctx: &MetalContext, input: &[u8]) -> Result<StringsOutput> {
     StringsStage::new().run(ctx, input)
+}
+
+/// The CPU half of the K11 long-string valve (`patch_number_fixups`'s
+/// sibling): for every flagged string-list entry, re-run the **shared
+/// reference unescaper** (`crate::unescape` — the same function
+/// `reference::stage6_strings` calls, so the two paths cannot diverge) and
+/// write the `[u32 LE len][content][NUL]` record into the string-buffer
+/// slice at its precomputed offset plus the `"` tape word at
+/// `tape_ofs[token]`. Both writes land in the shared `MTLBuffer` contents
+/// after `waitUntilCompleted` — the same memory-model situation as the
+/// number-fixup value-word patches. Record offsets were computed by
+/// `string_record_offsets` from token positions alone, so CPU-written
+/// records compose exactly with GPU-written neighbors (the pinned
+/// raw-length allocation; gap bytes in oversized slots stay unwritten,
+/// per the gap policy).
+///
+/// Returns the earliest packed `(offset << 32) | code` among flagged
+/// strings that reject ([`ERR_STRING_ESCAPE`] at the backslash,
+/// [`ERR_STRING_CONTROL`] at the control byte — reference-exact offsets),
+/// or `None` when every flagged string patched cleanly. Callers merge it
+/// into the verdict by packed minimum, exactly like fixup-driven number
+/// rejections; string extents are disjoint, so the minimum reproduces the
+/// reference's document-order-first verdict. Patch order does not matter
+/// (disjoint slots/tape words), so callers may pass the list in any order.
+///
+/// # Panics
+///
+/// If an index is out of range of the lists, a record/tape slot is out of
+/// range of its buffer, or the unescaper reports an error class stage 6
+/// cannot produce — all internal-contract violations (the fixup list is
+/// produced by K11 from the CB2-vetted string list).
+#[allow(clippy::too_many_arguments)] // mirrors the K11 kernel's flat buffer list
+pub fn patch_long_strings(
+    input: &[u8],
+    tok_pos: &[u32],
+    string_tokens: &[u32],
+    record_offsets: &[u64],
+    tape_ofs: &[u32],
+    long_fixups: &[u32],
+    stringbuf: &mut [u8],
+    tape: &mut [u64],
+) -> Option<u64> {
+    let mut first_error: Option<u64> = None;
+    for &s in long_fixups {
+        let t = string_tokens[s as usize] as usize;
+        // The close quote is the very next token (post-CB1 even quote
+        // total) — the same adjacency K11 relies on.
+        let open_pos = tok_pos[t] as usize;
+        let close_pos = tok_pos[t + 1] as usize;
+        let raw = &input[open_pos + 1..close_pos];
+        let base = u32::try_from(open_pos + 1).expect("input is capped below u32::MAX");
+        match crate::unescape::unescape(raw, base) {
+            Ok(bytes) => {
+                let rec = usize::try_from(record_offsets[s as usize]).expect("offset fits usize");
+                let len = u32::try_from(bytes.len()).expect("string longer than u32::MAX bytes");
+                stringbuf[rec..rec + STRING_RECORD_HEADER_BYTES]
+                    .copy_from_slice(&len.to_le_bytes());
+                let content = rec + STRING_RECORD_HEADER_BYTES;
+                stringbuf[content..content + bytes.len()].copy_from_slice(&bytes);
+                stringbuf[content + bytes.len()] = 0;
+                tape[tape_ofs[t] as usize] = make_string(record_offsets[s as usize]);
+            }
+            Err(Error::Syntax { offset, kind }) => {
+                let code = match kind {
+                    SyntaxErrorKind::InvalidStringEscape => ERR_STRING_ESCAPE,
+                    SyntaxErrorKind::ControlCharacterInString => ERR_STRING_CONTROL,
+                    other => panic!("the unescaper cannot produce {other:?}"),
+                };
+                let packed = (offset << 32) | u64::from(code);
+                first_error = Some(first_error.map_or(packed, |e| e.min(packed)));
+            }
+            Err(other) => panic!("the unescaper cannot produce {other:?}"),
+        }
+    }
+    first_error
 }
 
 #[cfg(test)]
@@ -485,6 +637,7 @@ mod tests {
         for (name, value) in [
             ("MJ_ERR_STRING_ESCAPE", ERR_STRING_ESCAPE),
             ("MJ_ERR_STRING_CONTROL", ERR_STRING_CONTROL),
+            ("MJ_LONG_STRING_THRESHOLD", LONG_STRING_THRESHOLD),
         ] {
             let needle = format!("constant constexpr uint {name} = {value};");
             assert!(
@@ -815,6 +968,165 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(content, want.as_bytes());
+    }
+
+    /// The long-string valve boundary: raw_len exactly AT the threshold
+    /// stays on the GPU (no fixups); one byte over takes the CPU patch
+    /// path — with identical record/tape output either way.
+    #[test]
+    fn long_string_valve_threshold_boundary() {
+        let Some(ctx) = ctx_or_skip("long_string_valve_threshold_boundary") else {
+            return;
+        };
+        let stage = StringsStage::new();
+        let at = LONG_STRING_THRESHOLD as usize;
+
+        // raw_len == threshold: GPU path.
+        let body = "a".repeat(at);
+        let out = stage.run(&ctx, &quoted(&[&body])).unwrap();
+        assert_eq!(out.error, None);
+        assert!(
+            out.long_string_fixups.is_empty(),
+            "at-threshold strings stay on the GPU"
+        );
+        assert_eq!(out.record_content(0), body.as_bytes());
+        assert_eq!(out.tape[1], make_string(0));
+
+        // raw_len == threshold + 1: the valve.
+        let body = "a".repeat(at + 1);
+        let out = stage.run(&ctx, &quoted(&[&body])).unwrap();
+        assert_eq!(out.error, None);
+        assert_eq!(
+            out.long_string_fixups,
+            vec![0],
+            "just-over strings take the valve"
+        );
+        assert_eq!(out.record_content(0), body.as_bytes());
+        assert_eq!(out.tape[1], make_string(0));
+
+        // Just over WITH an escape (raw_len = threshold + 1 via the 2-byte
+        // \n): the CPU unescape shrinks the record inside its slot.
+        let body = format!("{}{}", "a".repeat(at - 1), r"\n");
+        let out = stage.run(&ctx, &quoted(&[&body])).unwrap();
+        assert_eq!(out.error, None);
+        assert_eq!(out.long_string_fixups, vec![0]);
+        let mut want = vec![b'a'; at - 1];
+        want.push(b'\n');
+        assert_eq!(out.record_content(0), want);
+    }
+
+    /// Long strings with an error PAST the threshold reject on the CPU
+    /// patch path with the reference's exact (offset, code), merged into
+    /// the packed verdict like fixup-driven number rejections; the fixup
+    /// list stays reported on the rejection (diagnostic).
+    #[test]
+    fn long_string_valve_rejects_with_reference_offsets() {
+        let Some(ctx) = ctx_or_skip("long_string_valve_rejects_with_reference_offsets") else {
+            return;
+        };
+        let stage = StringsStage::new();
+        let n = LONG_STRING_THRESHOLD as usize + 100;
+
+        // Bad escape at raw offset n (absolute 1 + n: content starts one
+        // past the open quote).
+        let mut input = b"\"".to_vec();
+        input.extend(std::iter::repeat_n(b'a', n));
+        input.extend_from_slice(br"\q");
+        input.extend(std::iter::repeat_n(b'b', 8));
+        input.push(b'"');
+        let out = stage.run(&ctx, &input).unwrap();
+        assert_eq!(
+            out.error_offset_code(),
+            Some(((1 + n) as u64, ERR_STRING_ESCAPE)),
+            "escape error past the threshold, at the backslash"
+        );
+        assert_eq!(out.long_string_fixups, vec![0], "the valve was exercised");
+        assert_strings_empty(&out, "long escape rejection");
+
+        // Raw control byte past the threshold.
+        let mut input = b"\"".to_vec();
+        input.extend(std::iter::repeat_n(b'a', n));
+        input.push(0x01);
+        input.push(b'"');
+        let out = stage.run(&ctx, &input).unwrap();
+        assert_eq!(
+            out.error_offset_code(),
+            Some(((1 + n) as u64, ERR_STRING_CONTROL)),
+            "control error past the threshold, at the byte"
+        );
+        assert_eq!(out.long_string_fixups, vec![0]);
+        assert_strings_empty(&out, "long control rejection");
+
+        // Document-order-first across the GPU/CPU split: a SHORT bad
+        // string after a LONG bad string — the long string's earlier
+        // offset must win the merged fold.
+        let mut input = b"[\"".to_vec();
+        input.extend(std::iter::repeat_n(b'a', n));
+        input.extend_from_slice(b"\\q\",\"\\p\"]");
+        let out = stage.run(&ctx, &input).unwrap();
+        assert_eq!(
+            out.error_offset_code(),
+            Some(((2 + n) as u64, ERR_STRING_ESCAPE)),
+            "the long string's earlier backslash wins the merge"
+        );
+        assert_eq!(out.long_string_fixups, vec![0]);
+    }
+
+    /// Long + short strings interleaved: CPU-patched records land in their
+    /// precomputed slots without disturbing the GPU-written neighbors —
+    /// offsets and gaps hold around the patched records.
+    #[test]
+    fn long_and_short_strings_interleave_correctly() {
+        let Some(ctx) = ctx_or_skip("long_and_short_strings_interleave_correctly") else {
+            return;
+        };
+        let stage = StringsStage::new();
+        let t = LONG_STRING_THRESHOLD as usize;
+
+        let long_clean = "x".repeat(t + 7);
+        let long_escaped = format!("{}{}", "y".repeat(t), r"\n\t"); // raw t + 4, shrinks by 2
+        let bodies: [&str; 5] = ["a", &long_clean, r"b\n", &long_escaped, "cc"];
+        let mut input = b"[".to_vec();
+        let mut want_offsets = Vec::new();
+        let mut offset = 0u64;
+        for (i, &body) in bodies.iter().enumerate() {
+            if i > 0 {
+                input.push(b',');
+            }
+            input.extend_from_slice(&quoted(&[body]));
+            want_offsets.push(offset);
+            offset += body.len() as u64 + 5; // raw_len + 5 slots
+        }
+        input.push(b']');
+
+        let out = stage.run(&ctx, &input).unwrap();
+        assert_eq!(out.error, None);
+        assert_eq!(
+            out.long_string_fixups,
+            vec![1, 3],
+            "exactly the two long strings took the valve"
+        );
+        assert_eq!(out.record_offsets, want_offsets);
+        assert_eq!(out.stringbuf.len() as u64, offset);
+        let mut want_yy = vec![b'y'; t];
+        want_yy.extend_from_slice(b"\n\t");
+        let want_contents: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            long_clean.clone().into_bytes(),
+            b"b\n".to_vec(),
+            want_yy,
+            b"cc".to_vec(),
+        ];
+        assert_eq!(contents(&out), want_contents);
+        // Every tape word points at its slot (CPU-patched and GPU-written
+        // alike).
+        for (s, &tok) in out.stage2.string_tokens.iter().enumerate() {
+            assert_eq!(
+                out.tape[out.stage2.tape_ofs[tok as usize] as usize],
+                make_string(want_offsets[s]),
+                "tape word of record {s}"
+            );
+        }
     }
 
     /// Shrinking escapes create gaps but never move later offsets: slots
