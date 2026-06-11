@@ -181,8 +181,9 @@ static inline uint mj_key_max(uint64_t max_depth) {
 // depths above max_depth are DepthLimit errors. So `depth - 1` is an
 // order-isomorphic key in 0..=key_max, one 5-bit digit narrower than raw
 // depth at the 1024 default (keys 0..=1023 fit 2 passes; raw depth 1024
-// would need a 3rd). On error inputs the clamps below only keep the keys
-// in sortable range so K8/K9 stay memory-safe:
+// would need a 3rd). On error inputs the clamps below keep the keys in
+// sortable range so K8/K9 stay memory-safe, without disturbing the
+// reference's first-error verdict:
 //   - depth 0 (depth-0 separators, parked underflow closes) maps to key 0,
 //     merging into the depth-1 group. Harmless: a depth-0 separator's
 //     latest preceding bracket in the merged group is never an open (depth
@@ -190,12 +191,48 @@ static inline uint mj_key_max(uint64_t max_depth) {
 //     enclosing opener" and reports the reference's TrailingContent; and
 //     parked closes only exist after an underflow already reported at an
 //     offset <= theirs.
-//   - depths above max_depth clamp to key_max, merging into the deepest
-//     group. Harmless: such an element only exists after a DepthLimit
-//     error at an offset <= its own.
+//   - depths above max_depth (overflow) clamp to key_max, landing in (and
+//     only in) the deepest-key bucket. Letting them JOIN that bucket's
+//     group walk would corrupt the legal max_depth group (max_depth=1
+//     `[[1]`: the close would adjacent-pair with the INNER open, and the
+//     outer open's leftover UnbalancedBrackets at offset 0 — the
+//     reference's first error — would vanish behind DepthLimit@1). So K9
+//     treats overflow elements as INERT (mj_depth_overflows,
+//     10_pair_ctx.metal): they never advance the walk state, fire no
+//     rules, and write no outputs. This provably preserves the
+//     reference's first error:
+//       1. legal groups then walk exactly the reference's members in the
+//          same order (the sort is stable and skipping preserves the
+//          legal subsequence), so every legal-group error candidate
+//          matches the reference's;
+//       2. the depth scan's candidates (DepthLimit, underflow) are
+//          grouping-independent and already reference-exact;
+//       3. the reference's own overflow-group candidates can never win
+//          its earliest-offset fold: depth grows by 1 per open, so the
+//          FIRST overflow element is an open that phase 1 flags as
+//          DepthLimit at its own offset, and every other overflow element
+//          (hence every overflow-group candidate, including the leftover
+//          check at an overflow OPEN's offset) sits at an offset >= it —
+//          the reference records the phase-1 DepthLimit first on offset
+//          ties and earlier otherwise. The GPU's packed min agrees
+//          (MJ_ERR_DEPTH_LIMIT is the smallest CB3 code), so dropping
+//          the overflow-group candidates entirely changes nothing.
+//     Keeping overflow INSIDE the legal key range (instead of a dedicated
+//     key strictly above it) is what keeps key_max at max_depth - 1 and
+//     the K8 pass count at 2 for the 1024 default (a 1025th key value
+//     would need an 11th bit and a 3rd pass on every parse).
 static inline uint mj_sort_key(uint depth, uint key_max) {
     uint k = depth == 0u ? 0u : depth - 1u;
     return min(k, key_max);
+}
+
+// Is this element's depth past the max_depth limit? Such elements are
+// DepthLimit-flagged by the depth scan and must stay INERT in K9's group
+// walk — see the mj_sort_key contract above. `max_depth` is the raw
+// MjParams.reserved0 value (0 disables nothing: depth 1 already
+// overflows, matching the reference's `depth > max_depth` check).
+static inline bool mj_depth_overflows(uint depth, uint64_t max_depth) {
+    return uint64_t(depth) > max_depth;
 }
 
 // Byte at `i`, or a space for reads past the padded buffer. The input

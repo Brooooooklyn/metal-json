@@ -54,7 +54,11 @@ pub const SKELETON_CHUNK_ELEMS: usize = 1024;
 /// reject the input, discarding the sort output), so the sort key is
 /// `depth - 1` in `0..=max_depth - 1` (`mj_sort_key` in
 /// `shaders/common.h`) and the pass count is `ceil(bits(max_depth-1)/5)`:
-/// 1 pass for limits up to 32, 2 passes for the 1024 default.
+/// 1 pass for limits up to 32, 2 passes for the 1024 default. Error-input
+/// depths clamp INTO this key range rather than growing it (overflow
+/// depths share `key_max` but stay inert in K9 — the `mj_sort_key`
+/// contract), so the pass count never has to cover a key past
+/// `max_depth - 1`.
 #[must_use]
 pub fn sort_passes(max_depth: u32) -> usize {
     let key_max = max_depth.max(1) - 1;

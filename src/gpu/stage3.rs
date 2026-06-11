@@ -50,10 +50,13 @@
 //! The bit-exact spec for every output and error is
 //! `reference::stage4_structure` (src/reference/structure.rs) plus, for the
 //! tape words, `reference::emit_tape` (src/reference/emit.rs); the
-//! in-module tests diff the two backends on identical inputs. The one
-//! documented deviation (verdict-preserving, never visible in accepted
-//! outputs) is the depth scan's unclamped prefix sum past the first
-//! underflow — see `shaders/08_depth.metal`.
+//! in-module tests diff the two backends on identical inputs. Two
+//! documented deviations (verdict-preserving, never visible in accepted
+//! outputs): the depth scan's unclamped prefix sum past the first
+//! underflow (`shaders/08_depth.metal`), and K9 treating overflow depths
+//! (`> max_depth`, clamped into the deepest sort key) as inert instead of
+//! walking the reference's per-overflow-depth groups (the `mj_sort_key`
+//! contract in `shaders/common.h`).
 //!
 //! # The M3 tape and its HOLE convention
 //!
@@ -949,6 +952,69 @@ mod tests {
         );
     }
 
+    /// Overflow depths (> max_depth) clamp into the deepest sort key but
+    /// must stay INERT in K9 (the `mj_sort_key` contract): at max_depth=1,
+    /// `[[1]`'s legal depth 1 and overflow depth 2 share one sort bucket,
+    /// and pairing the close with the INNER open would suppress the outer
+    /// open's leftover error — the GPU must report the reference's first
+    /// error, UnbalancedBrackets at offset 0, not DepthLimit at 1. The
+    /// other pins sweep max_depth ∈ {1, 2, 3} over nesting shapes (the
+    /// expectations are the reference's verified verdicts; the
+    /// vs_reference sweep re-derives them from the oracle).
+    #[test]
+    fn overflow_depths_stay_inert_in_k9() {
+        let Some(ctx) = ctx_or_skip("overflow_depths_stay_inert_in_k9") else {
+            return;
+        };
+        let stage3 = Stage3::new();
+
+        // THE regression: the leftover-open error at offset 0 wins.
+        let out = stage3.run_with_max_depth(&ctx, b"[[1]", 1).unwrap();
+        assert_eq!(
+            out.error_offset_code(),
+            Some((0, ERR_UNBALANCED)),
+            "max_depth=1 [[1] reports the unclosed OUTER open, like the reference"
+        );
+
+        // (input, max_depth, expected offset, expected code) — the
+        // reference's rejection verdicts for the sweep.
+        let rejected: &[(&[u8], u32, u64, u32)] = &[
+            (b"[[1]", 1, 0, ERR_UNBALANCED),
+            (b"[[1]", 2, 0, ERR_UNBALANCED),
+            (b"[[1]", 3, 0, ERR_UNBALANCED),
+            (b"[[1]]", 1, 1, ERR_DEPTH_LIMIT),
+            (b"[[[1]]]", 1, 1, ERR_DEPTH_LIMIT),
+            (b"[[[1]]]", 2, 2, ERR_DEPTH_LIMIT),
+            (br#"{"a":[1]}"#, 1, 5, ERR_DEPTH_LIMIT),
+        ];
+        for &(input, max_depth, offset, code) in rejected {
+            let out = stage3.run_with_max_depth(&ctx, input, max_depth).unwrap();
+            assert_eq!(
+                out.error_offset_code(),
+                Some((offset, code)),
+                "max_depth={max_depth} {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        // ... and the at/under-limit siblings stay clean.
+        let accepted: &[(&[u8], u32)] = &[
+            (b"[[1]]", 2),
+            (b"[[1]]", 3),
+            (b"[[[1]]]", 3),
+            (br#"{"a":[1]}"#, 2),
+            (br#"{"a":[1]}"#, 3),
+        ];
+        for &(input, max_depth) in accepted {
+            let out = stage3.run_with_max_depth(&ctx, input, max_depth).unwrap();
+            assert_eq!(
+                out.error,
+                None,
+                "max_depth={max_depth} {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
     /// The single-pass sort path (max_depth ≤ 32 → 1 digit) must agree
     /// with the default two-pass path on the same clean input.
     #[test]
@@ -1518,9 +1584,21 @@ mod tests {
             }
 
             // Custom depth limits run through the same oracle, on both the
-            // 1-pass and the 2-pass sort paths.
+            // 1-pass and the 2-pass sort paths. `[[1]` and friends pin the
+            // inert-overflow contract: legal and overflow depths share the
+            // clamped key_max bucket, and the verdict must still be the
+            // reference's first error (UnbalancedBrackets@0 for `[[1]`,
+            // not DepthLimit at the inner open).
             for max_depth in [1, 2, 3, 31, 32, 33] {
-                for input in [&b"[[[[]]]]"[..], br#"{"a":[{"b":[]}]}"#, b"[[1,2],[3,4]]"] {
+                for input in [
+                    &b"[[[[]]]]"[..],
+                    br#"{"a":[{"b":[]}]}"#,
+                    b"[[1,2],[3,4]]",
+                    b"[[1]",
+                    b"[[1]]",
+                    b"[[[1]]]",
+                    br#"{"a":[1]}"#,
+                ] {
                     let label = format!(
                         "max_depth={max_depth} {:?}",
                         String::from_utf8_lossy(input)

@@ -856,7 +856,8 @@ mod tests {
         /// compare every stage-2 output bit-for-bit against reference
         /// stage 3 (+ the emit-defined tape positions); rejected inputs
         /// compare the verdict (offset + code), with the documented
-        /// odd-quote offset exception.
+        /// odd-quote exception (verdict parity only — offset AND class may
+        /// differ on multi-error inputs).
         fn diff(stage2: &Stage2, ctx: &MetalContext, input: &[u8], label: &str) {
             let got = stage2
                 .run(ctx, input)
@@ -881,26 +882,28 @@ mod tests {
                 .sum();
             if quote_total % 2 == 1 {
                 // Odd quotes are rejected in CB1 at offset input_len (the
-                // documented provisional offset); the reference reports the
-                // open quote's offset from stage 3 — class parity only.
+                // documented provisional offset); the reference rejects
+                // from stage 3 with its own offset and class — verdict
+                // parity only.
                 assert_eq!(
                     got.error_offset_code(),
                     Some((input.len() as u64, super::super::super::ERR_STRING)),
                     "{label}: odd-quote verdict"
                 );
-                if !input.is_empty() {
-                    let tokens = stage2_tokens(&bitmaps, input);
-                    assert!(
-                        matches!(
-                            stage3_validate_local(&tokens, input),
-                            Err(CrateError::Syntax {
-                                kind: SyntaxErrorKind::UnterminatedString,
-                                ..
-                            })
-                        ),
-                        "{label}: reference must agree the string is unterminated"
-                    );
-                }
+                // Verdict parity only: the reference must also reject — an
+                // odd quote count leaves a dangling QuoteOpen no rule table
+                // can accept. The CLASS may legitimately differ on
+                // multi-error inputs (`]"`: an earlier token-order
+                // violation reports UnexpectedToken@0 before the iteration
+                // ever reaches the unterminated string; the documented
+                // error policy in src/reference/mod.rs — backends may
+                // disagree about WHICH error, never about WHETHER parsing
+                // fails). Mirrors the relaxed pattern in tests/structure.rs.
+                let tokens = stage2_tokens(&bitmaps, input);
+                assert!(
+                    stage3_validate_local(&tokens, input).is_err(),
+                    "{label}: reference must also reject an odd-quote input"
+                );
                 return;
             }
 
@@ -1095,6 +1098,10 @@ mod tests {
                 b"[",
                 b"[[",
                 b"\"abc",
+                br#"]""#, // odd quotes AND an earlier token-order error:
+                // the GPU rejects in CB1 (ERR_STRING at input_len), the
+                // reference as UnexpectedToken@0 — verdict parity only
+                // (the relaxed odd-quote branch in `diff`).
                 br#"{"a"#,
                 br#"["a", "b"#,
                 br#"["": 1]"#,

@@ -761,6 +761,74 @@ fn depth_walls_at_and_past_the_limit() {
     }
 }
 
+/// Overflow depths (> max_depth) share the clamped key_max sort bucket
+/// with the legal max_depth group but must stay INERT in K9 (the
+/// `mj_sort_key` contract in shaders/common.h): at max_depth=1 the `[[1]`
+/// close must NOT adjacent-pair with the inner (overflow) open — that
+/// would suppress the outer open's leftover error and report DepthLimit@1
+/// where the reference's first error is UnbalancedBrackets@0. Pins the
+/// reference's own verdict explicitly, then sweeps max_depth ∈ {1, 2, 3}
+/// over the nesting shapes asserting GPU verdict + code + offset ==
+/// reference via `diff`.
+#[test]
+fn overflow_depth_groups_match_the_reference() {
+    let Some(ctx) = ctx_or_skip("overflow_depth_groups_match_the_reference") else {
+        return;
+    };
+    let stage3 = Stage3::new();
+
+    // The reference is the spec: verify it really puts the unclosed-open
+    // error (offset 0) ahead of the DepthLimit (offset 1) for `[[1]`.
+    let input: &[u8] = b"[[1]";
+    let tokens = stage2_tokens(&stage1_classify(input).unwrap(), input);
+    let s3 = stage3_validate_local(&tokens, input).expect("[[1] passes Layer 1");
+    match stage4_structure(&s3.skeleton, 1) {
+        Err(Error::Syntax {
+            offset: 0,
+            kind: SyntaxErrorKind::UnbalancedBrackets,
+        }) => {}
+        other => panic!("reference verdict for max_depth=1 [[1] moved: {other:?}"),
+    }
+    // ... and the GPU agrees exactly.
+    let got = stage3.run_with_max_depth(&ctx, input, 1).unwrap();
+    assert_eq!(
+        got.error_offset_code(),
+        Some((0, ERR_UNBALANCED)),
+        "max_depth=1 [[1]: the unclosed OUTER open wins, not DepthLimit@1"
+    );
+
+    for max_depth in [1u32, 2, 3] {
+        for input in [&b"[[1]"[..], b"[[1]]", b"[[[1]]]", br#"{"a":[1]}"#] {
+            let verdict = diff(
+                &stage3,
+                &ctx,
+                input,
+                max_depth,
+                &format!(
+                    "overflow sweep max_depth={max_depth} {:?}",
+                    String::from_utf8_lossy(input)
+                ),
+            );
+            // Sanity on the sweep's shape: `[[1]` always rejects
+            // structurally; the rest reject iff the nesting exceeds the
+            // limit (`diff` already asserted offset/code parity).
+            let depth = input.iter().filter(|&&b| b == b'[').count() as u32
+                + u32::from(input[0] == b'{');
+            let want = if input == &b"[[1]"[..] || depth > max_depth {
+                Verdict::Structural
+            } else {
+                Verdict::Clean
+            };
+            assert_eq!(
+                verdict,
+                want,
+                "max_depth={max_depth} {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+}
+
 /// A 100,000-element flat array: the skeleton (1 + 99,999 commas + 1)
 /// spans ~98 sort/scan chunks at depth 1 — the chunk-carry torture for
 /// the depth scan, the sort and the segmented context fill.

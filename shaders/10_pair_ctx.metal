@@ -48,13 +48,26 @@
 // Group boundaries need no histogram table: element j starts a group iff
 // j == 0 or its mj_sort_key differs from sorted neighbor j-1's.
 //
-// Write coverage (why no buffer here needs pre-zeroing): every element
-// writes its own context_opener; separators and closes write their own
-// match_index / child_counts; a close writes its open's match_index and
-// child_counts. On clean inputs every open is paired, so all entries are
-// written; unpaired entries can only exist on inputs this stage (or an
-// earlier one) rejects, whose CB3 outputs are never read (rejection
-// contract).
+// OVERFLOW ELEMENTS ARE INERT: an element whose depth exceeds max_depth
+// (mj_depth_overflows) shares the key_max sort key with the legal
+// max_depth group (mj_sort_key clamps — the key range must not grow, see
+// common.h), but it must not participate in that group's walk: it would
+// pair closes with the wrong opens and suppress leftover-open errors the
+// reference reports at earlier offsets (`[[1]` at max_depth=1). So every
+// walk transition and rule evaluation here skips overflow elements; the
+// boundary reset still applies (boundaries depend only on sort keys), and
+// the group-last leftover check still runs on them (with the walk state
+// the legal elements produced). The full first-error-preservation proof
+// lives on mj_sort_key in common.h.
+//
+// Write coverage (why no buffer here needs pre-zeroing): every NON-inert
+// element writes its own context_opener; separators and closes write
+// their own match_index / child_counts; a close writes its open's
+// match_index and child_counts. On clean inputs no element is inert and
+// every open is paired, so all entries are written; unwritten entries can
+// only exist on inputs this stage (or an earlier one) rejects — inert
+// elements imply a DepthLimit rejection — whose CB3 outputs are never
+// read (rejection contract).
 //
 // All kernels are dispatched as FULL 256-thread threadgroups.
 
@@ -110,9 +123,12 @@ static inline MjCtxState mj_ctx_combine(MjCtxState a, MjCtxState b) {
 // Advance the state across one element (boundary reset first, then the
 // element's delta) — the single transition both ctx_partials and
 // pair_ctx_apply use, so summaries and replays can never disagree.
+// Overflow elements are inert (`inert` true): the boundary reset still
+// applies, but the element contributes no delta to the walk state.
 static inline void mj_ctx_advance(
     thread MjCtxState& s,
     bool boundary,
+    bool inert,
     uchar byte,
     uint skel_idx,
     uint token_idx)
@@ -121,6 +137,9 @@ static inline void mj_ctx_advance(
         uint f = s.flags | 1u;
         s = mj_ctx_identity();
         s.flags = f;
+    }
+    if (inert) {
+        return;
     }
     if (byte == uchar(',')) {
         s.commas += 1u;
@@ -164,7 +183,8 @@ kernel void ctx_partials(
     threadgroup MjCtxState tg_states[THREADGROUP_SIZE];
 
     ulong m = params.element_count; // skeleton_total
-    uint key_max = mj_key_max(params.reserved0);
+    uint64_t max_depth = params.reserved0;
+    uint key_max = mj_key_max(max_depth);
     ulong base = ulong(tgid) * ulong(MJ_SKEL_CHUNK_ELEMS)
         + ulong(lid) * ulong(MJ_SKEL_PER_THREAD);
 
@@ -174,7 +194,8 @@ kernel void ctx_partials(
         if (t < m) {
             uint e = sorted[t];
             bool boundary = mj_group_boundary(sorted, depths, t, key_max);
-            mj_ctx_advance(s, boundary, skel_byte[e], e, skel_token_index[e]);
+            bool inert = mj_depth_overflows(depths[e], max_depth);
+            mj_ctx_advance(s, boundary, inert, skel_byte[e], e, skel_token_index[e]);
         }
     }
     tg_states[lid] = s;
@@ -315,7 +336,13 @@ static inline uint64_t mj_pair_eval(
             } else if (s.br_byte == uint('{')) {
                 // Object comma must introduce `"key":` — the next element
                 // of this depth group is the member's colon, exactly 3
-                // tokens later.
+                // tokens later. sorted[t + 1] may be an inert overflow
+                // element sharing the clamped key; treating it as "not the
+                // member colon" is reference-exact, because a real member
+                // colon (only quote tokens sit between `,` and a colon at
+                // +3 — Layer 1 bans every other token before `:`) has the
+                // comma's own depth and is its immediate doc-order
+                // neighbor, so it would BE sorted[t + 1].
                 bool ok = false;
                 if (t + 1 < m) {
                     uint next = sorted[t + 1];
@@ -352,7 +379,8 @@ kernel void pair_ctx_apply(
     threadgroup ulong lanes[THREADGROUP_SIZE];
 
     ulong m = params.element_count; // skeleton_total
-    uint key_max = mj_key_max(params.reserved0);
+    uint64_t max_depth = params.reserved0;
+    uint key_max = mj_key_max(max_depth);
     ulong base = ulong(tgid) * ulong(MJ_SKEL_CHUNK_ELEMS)
         + ulong(lid) * ulong(MJ_SKEL_PER_THREAD);
 
@@ -363,7 +391,8 @@ kernel void pair_ctx_apply(
         if (t < m) {
             uint e = sorted[t];
             bool boundary = mj_group_boundary(sorted, depths, t, key_max);
-            mj_ctx_advance(sum, boundary, skel_byte[e], e, skel_token_index[e]);
+            bool inert = mj_depth_overflows(depths[e], max_depth);
+            mj_ctx_advance(sum, boundary, inert, skel_byte[e], e, skel_token_index[e]);
         }
     }
     tg_states[lid] = sum;
@@ -383,8 +412,11 @@ kernel void pair_ctx_apply(
 
     // 3) Replay the walk over this thread's elements: boundary reset, then
     //    evaluate against the exclusive state, then advance — exactly the
-    //    reference's per-element order. The group's LAST element also runs
-    //    the unclosed-container check on the inclusive state.
+    //    reference's per-element order. Overflow elements are inert: they
+    //    reset on a boundary like everyone else but are neither evaluated
+    //    nor advanced over (see the module header). The group's LAST
+    //    element — inert or not — also runs the unclosed-container check
+    //    on the inclusive state the non-inert elements produced.
     MjCtxState s = tg_states[lid];
     uint64_t err = MJ_HEADER_NO_ERROR;
     for (uint j = 0u; j < MJ_SKEL_PER_THREAD; ++j) {
@@ -395,11 +427,13 @@ kernel void pair_ctx_apply(
             if (mj_group_boundary(sorted, depths, t, key_max)) {
                 s = mj_ctx_identity();
             }
-            err = min(err,
-                      mj_pair_eval(t, e, s, sorted, depths, skel_byte, skel_pos,
-                                   skel_token_index, match_index, context_opener,
-                                   child_counts, m, key_max));
-            mj_ctx_advance(s, false, b, e, skel_token_index[e]);
+            if (!mj_depth_overflows(depths[e], max_depth)) {
+                err = min(err,
+                          mj_pair_eval(t, e, s, sorted, depths, skel_byte, skel_pos,
+                                       skel_token_index, match_index, context_opener,
+                                       child_counts, m, key_max));
+                mj_ctx_advance(s, false, false, b, e, skel_token_index[e]);
+            }
 
             bool group_last = t + 1 == m
                 || mj_sort_key(depths[sorted[t + 1]], key_max)
