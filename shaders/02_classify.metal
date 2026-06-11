@@ -226,14 +226,9 @@ static inline uint mj_backslash_run(
     return uint(end - r);
 }
 
-static inline bool mj_is_ws_byte(uchar b) {
-    return b == uchar(0x20) || b == uchar(0x09) || b == uchar(0x0A) || b == uchar(0x0D);
-}
-
-static inline bool mj_is_op_byte(uchar b) {
-    return b == uchar('{') || b == uchar('}') || b == uchar('[') || b == uchar(']')
-        || b == uchar(':') || b == uchar(',');
-}
+// (mj_is_ws_byte / mj_is_op_byte / mj_load_padded live in common.h: K6's
+// literal checks share them, and the runtime-shaders path compiles all
+// units as one translation unit, so they must have a single definition.)
 
 // Compute the two carries for `word` by peeking backward at the raw input.
 // Returns the escape_info record (carry bits + valve flags).
@@ -319,13 +314,6 @@ static inline bool mj_utf8_lead(uchar b, thread uint& cont, thread uchar& lo, th
     }
     // 0x80..=0xC1 stray continuation / overlong 2-byte; 0xF5..=0xFF too big.
     return false;
-}
-
-// Byte at `i`, or a space for reads past the padded buffer (only reachable
-// for continuation probes of a lead near the very end; space is not a
-// continuation byte, so truncation fails exactly like the reference).
-static inline uchar mj_load_padded(device const uchar* input, ulong i, ulong padded_len) {
-    return i < padded_len ? input[i] : uchar(0x20);
 }
 
 // Validate every UTF-8 sequence that STARTS in `word`. A 3-byte raw

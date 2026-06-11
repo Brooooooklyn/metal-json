@@ -103,6 +103,45 @@ impl Stage1Output {
     pub fn error_offset_code(&self) -> Option<(u64, u32)> {
         self.error.map(|e| (e >> 32, e as u32))
     }
+
+    /// Build the output snapshot from the buffers + header. `error` is the
+    /// packed *stage-1* error (or `None`); when set, the rejection contract
+    /// applies — token outputs are reported empty regardless of buffer
+    /// state. Shared between [`Stage1::run_with_buffers`] and the stage-2
+    /// orchestration (`crate::gpu::stage2`), whose Layer-1 errors are NOT
+    /// stage-1 errors and therefore keep the token outputs.
+    pub(crate) fn snapshot(
+        bufs: &crate::stage::Stage1Buffers,
+        header: &crate::metal::MjHeader,
+        error: Option<u64>,
+    ) -> Self {
+        let rejected = error.is_some();
+        Self {
+            quote_real: bufs.bm_quote.as_slice::<u64>().to_vec(),
+            tokens: bufs.bm_tok.as_slice::<u64>().to_vec(),
+            tok_pos: if rejected {
+                Vec::new()
+            } else {
+                bufs.tok_pos
+                    .as_ref()
+                    .map(|b| b.as_slice::<u32>().to_vec())
+                    .unwrap_or_default()
+            },
+            tok_kind: if rejected {
+                Vec::new()
+            } else {
+                bufs.tok_kind
+                    .as_ref()
+                    .map(|b| b.as_slice::<u8>().to_vec())
+                    .unwrap_or_default()
+            },
+            quote_total: header.quote_total,
+            token_total: if rejected { 0 } else { header.token_total },
+            carry_overflow_count: header.carry_overflow_count,
+            error,
+            input_len: bufs.input_len(),
+        }
+    }
 }
 
 /// The six stage-1 kernels with their lazily-built, cached pipelines.
@@ -179,14 +218,85 @@ impl Stage1 {
         bufs: &mut Stage1Buffers,
     ) -> Result<(Stage1Output, f64)> {
         let input_len = bufs.input_len();
-        let words = bufs.words();
         let chunks = bufs.chunks();
-        if words == 0 {
+        if bufs.words() == 0 {
             // Zero-byte input: nothing to dispatch; empty outputs, no error
             // (EmptyInput is a stage-3 grammar verdict, not a stage-1 one).
             return Ok((Stage1Output::default(), 0.0));
         }
-        let mut gpu_seconds = 0.0f64;
+        let mut gpu_seconds = self.run_cb1(ctx, bufs)?;
+
+        // --- CB1 → CPU sync point ------------------------------------------
+        let header = bufs.read_header();
+
+        // Rejection contract (see Stage1Output): CB1 detected invalid UTF-8
+        // or an odd quote count, so the input is rejected and downstream
+        // outputs are never produced — skip the token allocation, K5/CB2 and
+        // the token readback entirely. The bitmaps and totals CB1 already
+        // wrote are returned for the valve/bitmap tests; token outputs stay
+        // empty (token_total = 0), mirroring how the eventual parser aborts.
+        if let Some((offset, code)) = header.first_error() {
+            let error = Some((offset << 32) | u64::from(code));
+            return Ok((Stage1Output::snapshot(bufs, &header, error), gpu_seconds));
+        }
+
+        // --- exact-size token allocation ------------------------------------
+        let token_total = usize::try_from(header.token_total).expect("token_total fits usize");
+        if token_total > input_len {
+            // A token occupies at least one input byte; anything else means
+            // the GPU pipeline corrupted its own header.
+            return Err(Error::CommandBuffer {
+                message: format!(
+                    "stage1 header reports {token_total} tokens for {input_len} input bytes"
+                ),
+            });
+        }
+        bufs.alloc_tokens(ctx, token_total)?;
+
+        // --- CB2: K5 scatter into the exact-size buffers --------------------
+        if token_total > 0 {
+            let word_params = MjParams {
+                input_len: input_len as u64,
+                element_count: bufs.words() as u64,
+                ..Default::default()
+            };
+            let mut batch = ctx.batch()?;
+            let h_input = batch.bind_read(&bufs.input);
+            let h_quote = batch.bind_read(&bufs.bm_quote);
+            let h_tok = batch.bind_read(&bufs.bm_tok);
+            let h_qcounts = batch.bind_read(&bufs.chunk_quote_counts);
+            let h_tcounts = batch.bind_read(&bufs.chunk_token_counts);
+            let h_pos = batch.bind_write(bufs.tok_pos.as_mut().expect("allocated above"));
+            let h_kind = batch.bind_write(bufs.tok_kind.as_mut().expect("allocated above"));
+            self.scatter.encode(
+                &mut batch,
+                &[h_input, h_quote, h_tok, h_qcounts, h_tcounts, h_pos, h_kind],
+                Some(&word_params),
+                Dispatch::Threadgroups(chunks),
+            )?;
+            gpu_seconds += batch.commit_and_wait_timed()?;
+        }
+
+        // No error: the rejection early-out above already returned.
+        Ok((Stage1Output::snapshot(bufs, &header, None), gpu_seconds))
+    }
+
+    /// Encode and run **CB1 only** (K1 → valve → K2 → K3 → K4: one commit,
+    /// one wait), leaving the CB1 → CPU sync — header read, rejection
+    /// check, exact token allocation — to the caller. `Stage1::run_with_buffers`
+    /// follows it with the lone K5 command buffer; the stage-2 orchestration
+    /// (`crate::gpu::stage2`) instead grows CB2 to K5 → K6 → K7. Returns
+    /// the command buffer's GPU execution time in seconds.
+    ///
+    /// `bufs.words()` must be nonzero (callers handle empty input first).
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub(crate) fn run_cb1(&self, ctx: &MetalContext, bufs: &mut Stage1Buffers) -> Result<f64> {
+        let input_len = bufs.input_len();
+        let words = bufs.words();
+        let chunks = bufs.chunks();
 
         // The cooperative kernels (threadgroup scans, chunk-aligned simd
         // reductions) are written for full 256-thread groups; the dispatch
@@ -219,126 +329,52 @@ impl Stage1 {
         };
 
         // --- CB1: K1 → valve → K2 → K3 → K4, one commit, one wait ---------
-        {
-            let mut batch = ctx.batch()?;
-            let h_input = batch.bind_read(&bufs.input);
-            let h_quote = batch.bind_write(&mut bufs.bm_quote);
-            let h_tok = batch.bind_write(&mut bufs.bm_tok);
-            let h_escape = batch.bind_write(&mut bufs.escape_info);
-            let h_qcounts = batch.bind_write(&mut bufs.chunk_quote_counts);
-            let h_tcounts = batch.bind_write(&mut bufs.chunk_token_counts);
-            let h_header = batch.bind_write(&mut bufs.header);
+        let mut batch = ctx.batch()?;
+        let h_input = batch.bind_read(&bufs.input);
+        let h_quote = batch.bind_write(&mut bufs.bm_quote);
+        let h_tok = batch.bind_write(&mut bufs.bm_tok);
+        let h_escape = batch.bind_write(&mut bufs.escape_info);
+        let h_qcounts = batch.bind_write(&mut bufs.chunk_quote_counts);
+        let h_tcounts = batch.bind_write(&mut bufs.chunk_token_counts);
+        let h_header = batch.bind_write(&mut bufs.header);
 
-            self.classify.encode(
-                &mut batch,
-                &[h_input, h_quote, h_tok, h_escape, h_qcounts, h_header],
-                Some(&word_params),
-                Dispatch::Threadgroups(words.div_ceil(THREADGROUP_SIZE)),
-            )?;
-            self.fixup.encode(
-                &mut batch,
-                &[h_input, h_escape, h_quote, h_tok, h_qcounts, h_header],
-                Some(&word_params),
-                Dispatch::Threadgroups(chunks),
-            )?;
-            self.spine_quote.encode(
-                &mut batch,
-                &[h_qcounts, h_header],
-                Some(&chunk_params),
-                Dispatch::Threadgroups(1),
-            )?;
-            self.token_mask.encode(
-                &mut batch,
-                &[h_quote, h_tok, h_qcounts, h_tcounts],
-                Some(&word_params),
-                Dispatch::Threadgroups(chunks),
-            )?;
-            self.spine_token.encode(
-                &mut batch,
-                &[h_tcounts, h_header],
-                Some(&chunk_params),
-                Dispatch::Threadgroups(1),
-            )?;
-            gpu_seconds += batch.commit_and_wait_timed()?;
-        }
+        self.classify.encode(
+            &mut batch,
+            &[h_input, h_quote, h_tok, h_escape, h_qcounts, h_header],
+            Some(&word_params),
+            Dispatch::Threadgroups(words.div_ceil(THREADGROUP_SIZE)),
+        )?;
+        self.fixup.encode(
+            &mut batch,
+            &[h_input, h_escape, h_quote, h_tok, h_qcounts, h_header],
+            Some(&word_params),
+            Dispatch::Threadgroups(chunks),
+        )?;
+        self.spine_quote.encode(
+            &mut batch,
+            &[h_qcounts, h_header],
+            Some(&chunk_params),
+            Dispatch::Threadgroups(1),
+        )?;
+        self.token_mask.encode(
+            &mut batch,
+            &[h_quote, h_tok, h_qcounts, h_tcounts],
+            Some(&word_params),
+            Dispatch::Threadgroups(chunks),
+        )?;
+        self.spine_token.encode(
+            &mut batch,
+            &[h_tcounts, h_header],
+            Some(&chunk_params),
+            Dispatch::Threadgroups(1),
+        )?;
+        batch.commit_and_wait_timed()
+    }
 
-        // --- CB1 → CPU sync point ------------------------------------------
-        let header = bufs.read_header();
-
-        // Rejection contract (see Stage1Output): CB1 detected invalid UTF-8
-        // or an odd quote count, so the input is rejected and downstream
-        // outputs are never produced — skip the token allocation, K5/CB2 and
-        // the token readback entirely. The bitmaps and totals CB1 already
-        // wrote are returned for the valve/bitmap tests; token outputs stay
-        // empty (token_total = 0), mirroring how the eventual parser aborts.
-        if let Some((offset, code)) = header.first_error() {
-            let output = Stage1Output {
-                quote_real: bufs.bm_quote.as_slice::<u64>().to_vec(),
-                tokens: bufs.bm_tok.as_slice::<u64>().to_vec(),
-                tok_pos: Vec::new(),
-                tok_kind: Vec::new(),
-                quote_total: header.quote_total,
-                token_total: 0,
-                carry_overflow_count: header.carry_overflow_count,
-                error: Some((offset << 32) | u64::from(code)),
-                input_len,
-            };
-            return Ok((output, gpu_seconds));
-        }
-
-        // --- exact-size token allocation ------------------------------------
-        let token_total = usize::try_from(header.token_total).expect("token_total fits usize");
-        if token_total > input_len {
-            // A token occupies at least one input byte; anything else means
-            // the GPU pipeline corrupted its own header.
-            return Err(Error::CommandBuffer {
-                message: format!(
-                    "stage1 header reports {token_total} tokens for {input_len} input bytes"
-                ),
-            });
-        }
-        bufs.alloc_tokens(ctx, token_total)?;
-
-        // --- CB2: K5 scatter into the exact-size buffers --------------------
-        if token_total > 0 {
-            let mut batch = ctx.batch()?;
-            let h_input = batch.bind_read(&bufs.input);
-            let h_quote = batch.bind_read(&bufs.bm_quote);
-            let h_tok = batch.bind_read(&bufs.bm_tok);
-            let h_qcounts = batch.bind_read(&bufs.chunk_quote_counts);
-            let h_tcounts = batch.bind_read(&bufs.chunk_token_counts);
-            let h_pos = batch.bind_write(bufs.tok_pos.as_mut().expect("allocated above"));
-            let h_kind = batch.bind_write(bufs.tok_kind.as_mut().expect("allocated above"));
-            self.scatter.encode(
-                &mut batch,
-                &[h_input, h_quote, h_tok, h_qcounts, h_tcounts, h_pos, h_kind],
-                Some(&word_params),
-                Dispatch::Threadgroups(chunks),
-            )?;
-            gpu_seconds += batch.commit_and_wait_timed()?;
-        }
-
-        let output = Stage1Output {
-            quote_real: bufs.bm_quote.as_slice::<u64>().to_vec(),
-            tokens: bufs.bm_tok.as_slice::<u64>().to_vec(),
-            tok_pos: bufs
-                .tok_pos
-                .as_ref()
-                .map(|b| b.as_slice::<u32>().to_vec())
-                .unwrap_or_default(),
-            tok_kind: bufs
-                .tok_kind
-                .as_ref()
-                .map(|b| b.as_slice::<u8>().to_vec())
-                .unwrap_or_default(),
-            quote_total: header.quote_total,
-            token_total: header.token_total,
-            carry_overflow_count: header.carry_overflow_count,
-            // No error: the rejection early-out above already returned.
-            error: None,
-            input_len,
-        };
-        Ok((output, gpu_seconds))
+    /// The K5 `token_scatter` stage, for orchestrations that encode K5 into
+    /// their own (grown) CB2 — see `crate::gpu::stage2`.
+    pub(crate) fn scatter_stage(&self) -> &Stage {
+        &self.scatter
     }
 }
 

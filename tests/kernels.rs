@@ -362,7 +362,7 @@ fn stage1_buffers_size_formulas_are_exact() {
             chunks * 4,
             "chunk_token_counts size for {len}"
         );
-        assert_eq!(bufs.header.len(), 64, "header size for {len}");
+        assert_eq!(bufs.header.len(), 128, "header size for {len}");
         assert!(bufs.tok_pos.is_none(), "tok_pos must wait for CB1");
         assert!(bufs.tok_kind.is_none(), "tok_kind must wait for CB1");
 

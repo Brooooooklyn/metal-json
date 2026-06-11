@@ -50,4 +50,38 @@ static inline uint tg_exclusive_scan_256(
     return parts[simd_id] + lane_prefix;
 }
 
+// 4-component exclusive prefix sum across a full 256-thread threadgroup —
+// the multi-component spine primitive of the M3 CB2 kernels (K6/K7/K6b),
+// which scan (tape words, skeleton count, string count, scalar count) in
+// one pass. Component-wise identical to tg_exclusive_scan_256: vector
+// simd_prefix_exclusive_sum carries nothing across components.
+//
+// `parts4` must be a threadgroup array of at least 9 uint4 shared by the
+// whole group; on return `parts4[8]` holds the 4 grand totals (valid for
+// every thread). Safe to call repeatedly with the same `parts4`.
+static inline uint4 tg_exclusive_scan4_256(
+    uint4 v,
+    uint simd_lane,
+    uint simd_id,
+    threadgroup uint4* parts4)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint4 lane_prefix = simd_prefix_exclusive_sum(v);
+    if (simd_lane == 31u) {
+        parts4[simd_id] = lane_prefix + v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id == 0u && simd_lane == 0u) {
+        uint4 running = uint4(0u);
+        for (uint i = 0u; i < 8u; ++i) {
+            uint4 t = parts4[i];
+            parts4[i] = running;
+            running += t;
+        }
+        parts4[8] = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return parts4[simd_id] + lane_prefix;
+}
+
 #endif // METAL_JSON_TG_SCAN_H

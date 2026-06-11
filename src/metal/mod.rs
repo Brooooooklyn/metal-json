@@ -40,14 +40,15 @@ pub struct MjParams {
 
 /// Per-parse result header the kernels write and the CPU reads between
 /// command buffers. Mirrors `struct MjHeader` in `shaders/common.h` — keep
-/// the layouts in sync (eight `u64` fields, 64 bytes, no padding; a layout
-/// test pins it).
+/// the layouts in sync (sixteen `u64` fields, 128 bytes, no padding; a
+/// layout test pins it).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MjHeader {
-    /// Packed `(byte_offset << 32) | MjErrorCode` reduced on the GPU with a
-    /// 64-bit `atomic_min`, so the earliest byte offset wins
-    /// deterministically (the code breaks ties). [`MjHeader::NO_ERROR`]
+    /// Packed `(byte_offset << 32) | MjErrorCode`, min-reduced on the GPU so
+    /// the earliest byte offset wins deterministically (the numeric code
+    /// order breaks same-offset ties — the tie-break contract documented on
+    /// `MjErrorCode` in `shaders/common.h`). [`MjHeader::NO_ERROR`]
     /// (all ones — any real error is smaller) when no kernel reported one.
     pub error: u64,
     /// K2 spine scan: total real-quote count over the whole input. Odd
@@ -60,13 +61,28 @@ pub struct MjHeader {
     /// the 4096-byte cap (`MJ_ESCAPE_LOOKBACK_CAP`) and need the sequential
     /// fix-up pass before K3.
     pub carry_overflow_count: u64,
-    /// Reserved; pads the header to 64 bytes. The low 32 bits of
-    /// `reserved[0]` are GPU scratch (`MjHeaderDev.utf8_error_offset`):
+    /// GPU scratch. The low 32 bits are `MjHeaderDev.utf8_error_offset`:
     /// K1 threads reduce UTF-8 error offsets there with a 32-bit
     /// `atomic_min` — 64-bit atomics are an Apple9+ device feature the
     /// embedded metallib cannot assume — and K2 thread 0 folds the winner
     /// into `error`. Initialized to the `u32::MAX` no-error sentinel.
-    pub reserved: [u64; 4],
+    pub utf8_scratch: u64,
+    /// K7 spine scan: total per-token tape words (the footprint sum). The
+    /// final tape is `tape_word_total + 2` words — the root prologue word
+    /// at `tape[0]` plus the final root word (reference `emit_tape`).
+    pub tape_word_total: u64,
+    /// K7 spine scan: total string-buffer bytes, `Σ (raw_len + 5)` over the
+    /// string literals in document order. Genuinely 64-bit: dense-string
+    /// inputs (`["",""...]`) exceed `u32` at max input size.
+    pub stringbuf_total: u64,
+    /// K7 spine scan: skeleton records (brackets + colons + commas).
+    pub skeleton_total: u64,
+    /// K7 spine scan: string-list records (`QuoteOpen` tokens).
+    pub string_total: u64,
+    /// K7 spine scan: scalar-list records (`ScalarStart` tokens).
+    pub scalar_total: u64,
+    /// Reserved; pads the header to 128 bytes.
+    pub reserved: [u64; 6],
 }
 
 impl MjHeader {
@@ -75,7 +91,8 @@ impl MjHeader {
     pub const NO_ERROR: u64 = u64::MAX;
 
     /// The UTF-8 scratch cell's "no error" sentinel, pre-set in the low 32
-    /// bits of `reserved[0]`. Mirrors `MJ_NO_UTF8_ERROR`.
+    /// bits of [`utf8_scratch`](Self::utf8_scratch). Mirrors
+    /// `MJ_NO_UTF8_ERROR`.
     pub const NO_UTF8_ERROR_SCRATCH: u64 = u32::MAX as u64;
 
     /// The initial header the CPU writes before CB1: no error, zero counts,
@@ -87,7 +104,13 @@ impl MjHeader {
             quote_total: 0,
             token_total: 0,
             carry_overflow_count: 0,
-            reserved: [Self::NO_UTF8_ERROR_SCRATCH, 0, 0, 0],
+            utf8_scratch: Self::NO_UTF8_ERROR_SCRATCH,
+            tape_word_total: 0,
+            stringbuf_total: 0,
+            skeleton_total: 0,
+            string_total: 0,
+            scalar_total: 0,
+            reserved: [0; 6],
         }
     }
 
@@ -192,13 +215,19 @@ mod tests {
 
     #[test]
     fn mj_header_layout_matches_common_h() {
-        assert_eq!(size_of::<MjHeader>(), 64);
+        assert_eq!(size_of::<MjHeader>(), 128);
         assert_eq!(align_of::<MjHeader>(), 8);
         assert_eq!(core::mem::offset_of!(MjHeader, error), 0);
         assert_eq!(core::mem::offset_of!(MjHeader, quote_total), 8);
         assert_eq!(core::mem::offset_of!(MjHeader, token_total), 16);
         assert_eq!(core::mem::offset_of!(MjHeader, carry_overflow_count), 24);
-        assert_eq!(core::mem::offset_of!(MjHeader, reserved), 32);
+        assert_eq!(core::mem::offset_of!(MjHeader, utf8_scratch), 32);
+        assert_eq!(core::mem::offset_of!(MjHeader, tape_word_total), 40);
+        assert_eq!(core::mem::offset_of!(MjHeader, stringbuf_total), 48);
+        assert_eq!(core::mem::offset_of!(MjHeader, skeleton_total), 56);
+        assert_eq!(core::mem::offset_of!(MjHeader, string_total), 64);
+        assert_eq!(core::mem::offset_of!(MjHeader, scalar_total), 72);
+        assert_eq!(core::mem::offset_of!(MjHeader, reserved), 80);
     }
 
     #[test]

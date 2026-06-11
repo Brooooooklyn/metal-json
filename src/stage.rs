@@ -34,6 +34,34 @@ pub const CHUNK_WORDS: usize = 1024;
 /// Input bytes per spine chunk (64 KiB).
 pub const CHUNK_BYTES: usize = WORD_BYTES * CHUNK_WORDS;
 
+/// Tokens per CB2 spine chunk and per K6/K6b threadgroup. Mirrors
+/// `MJ_TOK_CHUNK_TOKENS`. One 256-thread threadgroup covers one chunk at
+/// 4 tokens/thread (the K3/K5 shape transplanted to the token domain): K6
+/// emits one partial record per chunk, the K7 spine scan runs as a single
+/// threadgroup over those partials, K6b consumes the scanned carries.
+pub const TOKEN_CHUNK_TOKENS: usize = 1024;
+
+/// Skeleton elements per CB3 spine chunk and per depth/K8/K9 threadgroup.
+/// Mirrors `MJ_SKEL_CHUNK_ELEMS` (the K6 shape in the skeleton domain).
+pub const SKELETON_CHUNK_ELEMS: usize = 1024;
+
+/// Number of 5-bit digit passes the K8 counting sort needs to keep every
+/// *clean* sort key distinct, derived from the `max_depth` limit at encode
+/// time (the pass count must be known before the GPU observes any depth).
+///
+/// Clean inputs only carry depths `1..=max_depth` (depth-0 separators are
+/// `TrailingContent` errors, deeper nesting is a `DepthLimit` error — both
+/// reject the input, discarding the sort output), so the sort key is
+/// `depth - 1` in `0..=max_depth - 1` (`mj_sort_key` in
+/// `shaders/common.h`) and the pass count is `ceil(bits(max_depth-1)/5)`:
+/// 1 pass for limits up to 32, 2 passes for the 1024 default.
+#[must_use]
+pub fn sort_passes(max_depth: u32) -> usize {
+    let key_max = max_depth.max(1) - 1;
+    let bits = (32 - key_max.leading_zeros()).max(1) as usize;
+    bits.div_ceil(5)
+}
+
 /// K1 escape-carry look-back cap in bytes. Mirrors `MJ_ESCAPE_LOOKBACK_CAP`.
 ///
 /// The valve: a K1 thread resolving whether its word starts escaped peeks
@@ -196,7 +224,7 @@ impl TestHarness {
 /// | `escape_info`        | `words * 1`         | K1 carries + valve flags per word     |
 /// | `chunk_quote_counts` | `chunks * 4`        | K1 partials → K2 scan (in place)      |
 /// | `chunk_token_counts` | `chunks * 4`        | K3 partials → K4 scan (in place)      |
-/// | `header`             | 64                  | [`MjHeader`]                          |
+/// | `header`             | 128                 | [`MjHeader`]                          |
 /// | `tok_pos`            | `token_total * 4`   | u32 byte positions (post-CB1)         |
 /// | `tok_kind`           | `token_total * 1`   | u8 `TokenKind` discriminants          |
 ///
@@ -384,7 +412,7 @@ impl Stage1Buffers {
     /// zero-filled, header back to [`MjHeader::new`]) and drops the token
     /// buffers (the next parse re-allocates them at its exact token count).
     /// `input`, the bitmaps and `escape_info` need no reset — K1 overwrites
-    /// them. Cheap: 4 bytes per 64 KiB chunk plus the 64-byte header.
+    /// them. Cheap: 4 bytes per 64 KiB chunk plus the 128-byte header.
     pub fn reset_for_reuse(&mut self) {
         self.chunk_quote_counts.contents_mut().fill(0);
         self.chunk_token_counts.contents_mut().fill(0);
@@ -404,6 +432,288 @@ impl Stage1Buffers {
     }
 }
 
+// --- Stage2Buffers ----------------------------------------------------------------
+
+/// All GPU buffers specific to the CB2 structure extension (K6 validate →
+/// K7 spine3, then K6b apply after the CPU sync 2). Sizes derive from
+/// `token_total` (known after the CB1 → CPU sync); only the skeleton /
+/// string / scalar list buffers wait for the second sync that reads the K7
+/// totals from the header — the same exact-size allocation rule as
+/// `tok_pos`/`tok_kind` after CB1.
+///
+/// Size formulas (`t` = token count, `c` = `ceil(t / 1024)`
+/// ([`TOKEN_CHUNK_TOKENS`])):
+///
+/// | buffer               | size (bytes)         | contents                                  |
+/// |----------------------|----------------------|-------------------------------------------|
+/// | `chunk_counts`       | `c * 16`             | uint4 (tape words, skeleton, string, scalar) partials → K7 scan (in place) |
+/// | `chunk_string_bytes` | `c * 8`              | u64 `Σ raw_len + 5` partials → K7 scan (in place) |
+/// | `chunk_error`        | `c * 8`              | per-chunk min packed error → K7 fold       |
+/// | `tape_ofs`           | `t * 4`              | u32 tape position per token (K6b)          |
+/// | `skel_token_index`   | `skeleton_total * 4` | u32 token index per skeleton record (post-K7) |
+/// | `skel_pos`           | `skeleton_total * 4` | u32 byte position per skeleton record (post-K7) |
+/// | `skel_byte`          | `skeleton_total`     | u8 structural byte `{}[]:,` (post-K7)      |
+/// | `string_tokens`      | `string_total * 4`   | u32 `QuoteOpen` token indices (post-K7)    |
+/// | `scalar_tokens`      | `scalar_total * 4`   | u32 `ScalarStart` token indices (post-K7)  |
+///
+/// # Zero/init preconditions
+///
+/// None. Unlike the stage-1 chunk count buffers (which K1 accumulates into
+/// with atomics), every buffer here is **fully overwritten** by exactly one
+/// single-writer kernel pass: K6's thread 0 plain-stores every chunk entry
+/// of the three chunk buffers, and K6b's dense document-order ranks write
+/// every entry of `tape_ofs` and the lists exactly once (the K7 totals the
+/// lists were allocated from come from the same per-token classification).
+/// Constructed fresh per parse in M3; the M5 buffer pool can reuse these
+/// without resets.
+#[derive(Debug)]
+pub struct Stage2Buffers {
+    token_total: usize,
+    chunks: usize,
+    /// K6 output: one `uint4` of partial counts per token chunk —
+    /// (tape words, skeleton records, string records, scalar records).
+    /// K7 rewrites it **in place** as four exclusive prefix sums (the chunk
+    /// carries K6b adds to its in-chunk ranks) and stores the grand totals
+    /// in [`MjHeader::tape_word_total`] / `skeleton_total` / `string_total`
+    /// / `scalar_total`.
+    pub chunk_counts: GpuBuffer,
+    /// K6 output: one u64 string-slot byte sum (`Σ raw_len + 5`) per token
+    /// chunk. 64-bit because a single string literal can exceed `u32`. K7
+    /// rewrites it in place as an exclusive prefix sum (consumed by the M4
+    /// string kernel) and stores the total in [`MjHeader::stringbuf_total`].
+    pub chunk_string_bytes: GpuBuffer,
+    /// K6 output: one packed `(offset << 32) | code` minimum per token
+    /// chunk (`u64::MAX` = no error in the chunk), reduced deterministically
+    /// in threadgroup memory — never device atomics. K7 min-folds these
+    /// into [`MjHeader::error`].
+    pub chunk_error: GpuBuffer,
+    /// K6b output: tape position of every token — `1 +` the exclusive
+    /// prefix sum of the tape footprints, the `+1` being the root prologue
+    /// word at `tape[0]` (reference `emit_tape` seeds its running position
+    /// at 1). Allocated up front (`token_total` is already exact); written
+    /// only if Layer-1 validation passes (rejection contract).
+    pub tape_ofs: GpuBuffer,
+    /// K6b output: skeleton record field 1 of 3 — the stage-2 token index
+    /// of each bracket / colon / comma, document order. Field values are
+    /// bit-identical to the reference `SkeletonRecord.token_index`; the
+    /// record is materialized struct-of-arrays (the reference's
+    /// `{u32, u32, u8}` struct would pad to 12 bytes per record on the
+    /// GPU). `None` until [`alloc_lists`](Self::alloc_lists).
+    pub skel_token_index: Option<GpuBuffer>,
+    /// K6b output: skeleton record field 2 — byte offset in the input
+    /// (`SkeletonRecord.pos`). `None` until [`alloc_lists`](Self::alloc_lists).
+    pub skel_pos: Option<GpuBuffer>,
+    /// K6b output: skeleton record field 3 — the structural byte, one of
+    /// `{ } [ ] : ,` (`SkeletonRecord.byte`; open/close brackets of one
+    /// type differ by exactly `0x06`, which CB3's pair matching exploits).
+    /// `None` until [`alloc_lists`](Self::alloc_lists).
+    pub skel_byte: Option<GpuBuffer>,
+    /// K6b output: `QuoteOpen` token indices in document order — the M4
+    /// string kernel's work list (mirrors the reference
+    /// `UnescapedString.token_index` order). `None` until
+    /// [`alloc_lists`](Self::alloc_lists).
+    pub string_tokens: Option<GpuBuffer>,
+    /// K6b output: `ScalarStart` token indices in document order — the M4
+    /// number/literal kernel's work list (mirrors the reference
+    /// `ParsedScalar.token_index` order). `None` until
+    /// [`alloc_lists`](Self::alloc_lists).
+    pub scalar_tokens: Option<GpuBuffer>,
+}
+
+impl Stage2Buffers {
+    /// Allocate every `token_total`-derived buffer (`token_total` must be
+    /// the exact [`MjHeader::token_total`] from the CB1 sync, > 0 — empty
+    /// token streams are an `EmptyInput` verdict decided on the CPU and
+    /// never reach the CB2 kernels).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BufferAlloc`] if the device is out of memory.
+    pub fn new(ctx: &MetalContext, token_total: usize) -> Result<Self> {
+        let chunks = token_total.div_ceil(TOKEN_CHUNK_TOKENS);
+        Ok(Self {
+            token_total,
+            chunks,
+            chunk_counts: GpuBuffer::alloc(ctx, chunks * 4 * size_of::<u32>())?,
+            chunk_string_bytes: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
+            chunk_error: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
+            tape_ofs: GpuBuffer::alloc(ctx, token_total * size_of::<u32>())?,
+            skel_token_index: None,
+            skel_pos: None,
+            skel_byte: None,
+            string_tokens: None,
+            scalar_tokens: None,
+        })
+    }
+
+    /// Token count these buffers were sized for.
+    #[must_use]
+    pub fn token_total(&self) -> usize {
+        self.token_total
+    }
+
+    /// Token spine chunks: `ceil(token_total / 1024)`. The K6/K6b grid size
+    /// and the K7 scan length.
+    #[must_use]
+    pub fn chunks(&self) -> usize {
+        self.chunks
+    }
+
+    /// Apply the exact list sizes read from the K7 totals after the CPU
+    /// sync 2: allocates the three skeleton arrays plus the string / scalar
+    /// work lists — exact-size, never an `input_len`-proportional guess.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BufferAlloc`] if the device is out of memory.
+    pub fn alloc_lists(
+        &mut self,
+        ctx: &MetalContext,
+        skeleton_total: usize,
+        string_total: usize,
+        scalar_total: usize,
+    ) -> Result<()> {
+        self.skel_token_index = Some(GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?);
+        self.skel_pos = Some(GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?);
+        self.skel_byte = Some(GpuBuffer::alloc(ctx, skeleton_total)?);
+        self.string_tokens = Some(GpuBuffer::alloc(ctx, string_total * size_of::<u32>())?);
+        self.scalar_tokens = Some(GpuBuffer::alloc(ctx, scalar_total * size_of::<u32>())?);
+        Ok(())
+    }
+}
+
+// --- Stage3Buffers ----------------------------------------------------------------
+
+/// Bytes per `MjCtxState` entry (the K9 segmented-scan chunk summary /
+/// carry record). Mirrors `struct MjCtxState` in `shaders/10_pair_ctx.metal`
+/// — eight `u32` fields, keep in sync.
+pub const CTX_STATE_BYTES: usize = 32;
+
+/// All GPU buffers specific to CB3 (depth scan → K8 counting sort → K9
+/// pair/context → error fold). Every size derives from `skeleton_total`
+/// (read at the CPU sync 2) and the sort pass count
+/// ([`sort_passes`]`(max_depth)`), both known before CB3 is encoded — no
+/// further CPU sync is needed inside CB3.
+///
+/// Size formulas (`m` = skeleton elements, `c` = `ceil(m / 1024)`
+/// ([`SKELETON_CHUNK_ELEMS`])):
+///
+/// | buffer            | size (bytes) | contents                                        |
+/// |-------------------|--------------|--------------------------------------------------|
+/// | `chunk_depth`     | `c * 8`      | i64 chunk weight sums → depth spine carries (in place) |
+/// | `depths`          | `m * 4`      | u32 depth per skeleton element                   |
+/// | `chunk_error`     | `c * 8`      | per-chunk min packed CB3 error (depth scan, then K9 folds on top) |
+/// | `sort_hist`       | `32 * c * 4` | bucket-major digit histogram → matrix scan (in place), per pass |
+/// | `sorted`          | `m * 4`      | the final (depth, document-order) ordering       |
+/// | `sorted_scratch`  | `m * 4`      | radix ping-pong; `None` for single-pass sorts    |
+/// | `chunk_ctx`       | `c * 32`     | K9 segmented-scan summaries → carries (in place) |
+/// | `match_index`     | `m * 4`      | partner skeleton index per bracket (`NO_MATCH` for separators) |
+/// | `context_opener`  | `m * 1`      | enclosing opener byte per separator, 0 for brackets |
+/// | `child_counts`    | `m * 4`      | direct children per open bracket, 0 otherwise    |
+///
+/// # Zero/init preconditions
+///
+/// None. `chunk_depth`, `chunk_error`, `sort_hist` and `chunk_ctx` are
+/// fully plain-stored by their producer kernels each dispatch; the sort
+/// scatter writes a permutation (every slot exactly once); `depths` is
+/// fully written by `depth_apply`; and `match_index` / `context_opener` /
+/// `child_counts` are fully written by `pair_ctx_apply` on every input
+/// whose outputs are ever read (unpaired-open entries can only be stale on
+/// inputs CB3 rejects, and the rejection contract discards those outputs).
+#[derive(Debug)]
+pub struct Stage3Buffers {
+    skeleton_total: usize,
+    chunks: usize,
+    passes: usize,
+    /// Depth-scan chunk partials, rewritten in place by `depth_spine` as
+    /// the signed depth entering each chunk. i64: the running depth across
+    /// chunks can exceed `i32` at max input size.
+    pub chunk_depth: GpuBuffer,
+    /// Depth of every skeleton element (root container = 1), bit-identical
+    /// to reference `Stage4Output::depths` on accepted inputs.
+    pub depths: GpuBuffer,
+    /// One packed `(offset << 32) | code` minimum per skeleton chunk:
+    /// `depth_apply` plain-stores the depth-scan candidates, then
+    /// `pair_ctx_apply` min-folds its own on top (same chunk index space),
+    /// and `structure_finalize` folds the buffer into `MjHeader::error`.
+    pub chunk_error: GpuBuffer,
+    /// The 32 × chunks bucket-major digit histogram of the current sort
+    /// pass, rewritten in place by `sort_matrix_scan` as global output
+    /// slots. Re-produced from scratch each pass.
+    pub sort_hist: GpuBuffer,
+    /// Skeleton indices in (depth, document-order) order — the final K8
+    /// output, bit-identical to reference `Stage4Output::sorted_by_depth`.
+    pub sorted: GpuBuffer,
+    /// Radix ping-pong partner of [`sorted`](Self::sorted); only allocated
+    /// when the sort needs more than one pass.
+    pub sorted_scratch: Option<GpuBuffer>,
+    /// K9 segmented-scan chunk summaries ([`CTX_STATE_BYTES`] each),
+    /// rewritten in place by `ctx_spine` as exclusive walk-state carries.
+    pub chunk_ctx: GpuBuffer,
+    /// For brackets: skeleton index of the matching bracket; `NO_MATCH`
+    /// (u32::MAX) for separators. Mirrors `Stage4Output::match_index`.
+    pub match_index: GpuBuffer,
+    /// For separators: the enclosing opener byte (`{` or `[`); 0 for
+    /// brackets. Mirrors `Stage4Output::context_opener`.
+    pub context_opener: GpuBuffer,
+    /// For open brackets: number of direct children (full width; K12
+    /// saturates). Mirrors `Stage4Output::child_counts`.
+    pub child_counts: GpuBuffer,
+}
+
+impl Stage3Buffers {
+    /// Allocate every CB3 buffer for `skeleton_total` elements and `passes`
+    /// sort passes ([`sort_passes`]). `skeleton_total` must be > 0 — an
+    /// empty skeleton (root scalar) skips CB3 entirely.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BufferAlloc`] if the device is out of memory.
+    pub fn new(ctx: &MetalContext, skeleton_total: usize, passes: usize) -> Result<Self> {
+        assert!(skeleton_total > 0, "empty skeletons never dispatch CB3");
+        assert!(passes > 0, "the sort always runs at least one pass");
+        let chunks = skeleton_total.div_ceil(SKELETON_CHUNK_ELEMS);
+        Ok(Self {
+            skeleton_total,
+            chunks,
+            passes,
+            chunk_depth: GpuBuffer::alloc(ctx, chunks * size_of::<i64>())?,
+            depths: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
+            chunk_error: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
+            sort_hist: GpuBuffer::alloc(ctx, 32 * chunks * size_of::<u32>())?,
+            sorted: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
+            sorted_scratch: if passes > 1 {
+                Some(GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?)
+            } else {
+                None
+            },
+            chunk_ctx: GpuBuffer::alloc(ctx, chunks * CTX_STATE_BYTES)?,
+            match_index: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
+            context_opener: GpuBuffer::alloc(ctx, skeleton_total)?,
+            child_counts: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
+        })
+    }
+
+    /// Skeleton element count these buffers were sized for.
+    #[must_use]
+    pub fn skeleton_total(&self) -> usize {
+        self.skeleton_total
+    }
+
+    /// Skeleton spine chunks: `ceil(skeleton_total / 1024)`. The CB3
+    /// per-chunk grid size and the spine scan lengths.
+    #[must_use]
+    pub fn chunks(&self) -> usize {
+        self.chunks
+    }
+
+    /// Counting-sort passes these buffers were sized for.
+    #[must_use]
+    pub fn passes(&self) -> usize {
+        self.passes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +724,23 @@ mod tests {
         assert_eq!(CHUNK_BYTES, 65536);
         // The look-back cap must cover whole words.
         assert_eq!(ESCAPE_LOOKBACK_CAP % WORD_BYTES, 0);
+        // One 256-thread group, 4 tokens/thread, covers one token chunk.
+        assert_eq!(TOKEN_CHUNK_TOKENS, crate::metal::THREADGROUP_SIZE * 4);
+        assert_eq!(SKELETON_CHUNK_ELEMS, crate::metal::THREADGROUP_SIZE * 4);
+    }
+
+    #[test]
+    fn sort_pass_counts_cover_the_clean_key_range() {
+        // Keys are depth-1 in 0..max_depth; each pass covers 5 bits.
+        assert_eq!(sort_passes(1), 1);
+        assert_eq!(sort_passes(31), 1);
+        assert_eq!(sort_passes(32), 1, "key_max 31 still fits one digit");
+        assert_eq!(sort_passes(33), 2);
+        assert_eq!(sort_passes(1024), 2, "the simdjson-parity default");
+        assert_eq!(sort_passes(1025), 3);
+        assert_eq!(sort_passes(u32::MAX), 7);
+        // Degenerate limit: still dispatches a (vacuous) single pass.
+        assert_eq!(sort_passes(0), 1);
     }
 
     #[cfg(feature = "cpu-reference")]

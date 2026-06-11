@@ -131,6 +131,30 @@ mod runtime {
             "05_token_scatter.metal",
             include_str!("../../shaders/05_token_scatter.metal"),
         ),
+        (
+            "06_validate.metal",
+            include_str!("../../shaders/06_validate.metal"),
+        ),
+        (
+            "07_spine3.metal",
+            include_str!("../../shaders/07_spine3.metal"),
+        ),
+        (
+            "08_depth.metal",
+            include_str!("../../shaders/08_depth.metal"),
+        ),
+        (
+            "09_sort.metal",
+            include_str!("../../shaders/09_sort.metal"),
+        ),
+        (
+            "10_pair_ctx.metal",
+            include_str!("../../shaders/10_pair_ctx.metal"),
+        ),
+        (
+            "11_emit.metal",
+            include_str!("../../shaders/11_emit.metal"),
+        ),
     ];
 
     fn shader_dir_override() -> Option<PathBuf> {
