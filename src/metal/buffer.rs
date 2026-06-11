@@ -27,7 +27,15 @@ pub struct GpuBuffer {
 }
 
 impl GpuBuffer {
-    /// Allocate a zero-initialized shared buffer of `len` bytes.
+    /// Allocate a shared buffer of `len` bytes.
+    ///
+    /// Contents are **unspecified**: freshly created `MTLBuffer`s happen to
+    /// arrive zero-filled today (the OS hands out zeroed VM pages), but that
+    /// is an allocator accident, not part of this contract — a pooled/reused
+    /// buffer (planned for M5) keeps its previous contents. Callers that
+    /// need a known starting state must fill it explicitly (as
+    /// [`Stage1Buffers::new`](crate::stage::Stage1Buffers::new) does for the
+    /// buffers its kernels accumulate into).
     pub fn alloc(ctx: &MetalContext, len: usize) -> Result<Self> {
         // Metal returns nil for zero-length buffers; keep the allocation
         // non-empty and let `len` carry the logical size.

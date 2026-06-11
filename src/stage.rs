@@ -141,9 +141,12 @@ impl TestHarness {
     }
 
     /// Allocate a zero-initialized GPU buffer for `count` elements of `T`
-    /// (an output, or a zeroed intermediate).
+    /// (an output, or a zeroed intermediate). Zeroing is explicit —
+    /// [`GpuBuffer::alloc`] makes no contents guarantee.
     pub fn alloc_zeroed<T: Pod>(&self, count: usize) -> Result<GpuBuffer> {
-        GpuBuffer::alloc(&self.ctx, count * size_of::<T>())
+        let mut buffer = GpuBuffer::alloc(&self.ctx, count * size_of::<T>())?;
+        buffer.contents_mut().fill(0);
+        Ok(buffer)
     }
 
     /// Dispatch `stage` once over `work`, synchronously, with the M0
@@ -204,6 +207,30 @@ impl TestHarness {
 /// little-endian that IS the u64 layout, so tests read `bm_quote`/`bm_tok`
 /// as `&[u64]` and diff directly against the reference
 /// `Bitmaps` (`crate::reference::Bitmaps`) vectors.
+///
+/// # Zero/init preconditions (stage-1 invariant)
+///
+/// Some buffers are **accumulated into** by the kernels (read-modify-write),
+/// so stage 1 is only correct when they start in a known state. Fresh
+/// `MTLBuffer`s happen to arrive zero-filled today (zeroed VM pages), but
+/// that is an allocator accident — [`GpuBuffer::alloc`] guarantees nothing,
+/// and a pooled/reused buffer (planned for M5) keeps its old contents. The
+/// constructor therefore establishes every precondition **explicitly**, and
+/// [`reset_for_reuse`](Self::reset_for_reuse) re-establishes them for a
+/// fresh parse over the same allocations:
+///
+/// | buffer               | precondition       | accumulating kernel(s)                       |
+/// |----------------------|--------------------|-----------------------------------------------|
+/// | `chunk_quote_counts` | all zero           | K1 `atomic_add`s simdgroup partials (skipping zero totals); the K1b valve `atomic_add`s repair deltas |
+/// | `chunk_token_counts` | all zero           | none today — K3 plain-stores every entry — zeroed defensively so the buffer is pool-safe |
+/// | `header`             | [`MjHeader::new`]  | K1 `atomic_add`s `carry_overflow_count`, `atomic_min`s the UTF-8 scratch sentinel; K2 `min`-folds `error` |
+///
+/// `bm_quote`, `bm_tok` and `escape_info` carry **no** precondition (K1
+/// overwrites every word unconditionally), `input` is fully written by the
+/// constructor, and `tok_pos`/`tok_kind` are fully written by the K5
+/// scatter (dense ranks). The poisoned-buffer test in `tests/kernels.rs`
+/// (`poisoned_buffers_reset_to_a_fresh_parse_state`) pins this invariant
+/// against allocator behavior.
 #[derive(Debug)]
 pub struct Stage1Buffers {
     /// The input bytes, copied and padded with ASCII spaces (0x20) to a
@@ -241,14 +268,27 @@ pub struct Stage1Buffers {
     /// prefix sums — the quote-rank carry whose low bit seeds each chunk's
     /// in-string parity in K3 — and writes the grand total to
     /// [`MjHeader::quote_total`].
+    ///
+    /// **Must be all-zero before K1** (see the struct docs): K1 and the K1b
+    /// valve accumulate with `atomic_add`, and K1 skips zero partials
+    /// entirely. Enforced by [`new`](Self::new) and
+    /// [`reset_for_reuse`](Self::reset_for_reuse).
     pub chunk_quote_counts: GpuBuffer,
     /// One u32 per chunk. K3 writes per-chunk token popcounts; the K4 spine
     /// scan rewrites them as exclusive prefix sums — the token-rank carry
     /// K5 adds to its in-word prefix popcount — and writes the total to
     /// [`MjHeader::token_total`].
+    ///
+    /// Zeroed by [`new`](Self::new) and
+    /// [`reset_for_reuse`](Self::reset_for_reuse). K3 plain-stores every
+    /// entry today, so this is defense in depth rather than a hard
+    /// precondition (see the struct docs).
     pub chunk_token_counts: GpuBuffer,
-    /// One [`MjHeader`], initialized by the constructor (error =
-    /// [`MjHeader::NO_ERROR`], counts zero).
+    /// One [`MjHeader`]. **Must be [`MjHeader::new`] before CB1** (see the
+    /// struct docs): K1 `atomic_add`s the carry-overflow counter and
+    /// `atomic_min`s the UTF-8 scratch cell, and K2 `min`-folds the error
+    /// word — all relative to the initialized state. Enforced by
+    /// [`new`](Self::new) and [`reset_for_reuse`](Self::reset_for_reuse).
     pub header: GpuBuffer,
     /// K5 output: token byte positions (u32), exactly `token_total` of
     /// them. `None` until [`alloc_tokens`](Self::alloc_tokens) applies the
@@ -261,8 +301,11 @@ pub struct Stage1Buffers {
 }
 
 impl Stage1Buffers {
-    /// Allocate every input-length-derived buffer and initialize the
-    /// header; copies `input` into a space-padded GPU buffer.
+    /// Allocate every input-length-derived buffer, copy `input` into a
+    /// space-padded GPU buffer, and **explicitly establish the zero/init
+    /// preconditions** (chunk count buffers zero-filled, header set to
+    /// [`MjHeader::new`]) — see the struct docs; fresh allocations arriving
+    /// zeroed is an accident this constructor must not rely on.
     ///
     /// # Errors
     ///
@@ -283,12 +326,17 @@ impl Stage1Buffers {
         bytes[..input.len()].copy_from_slice(input);
         bytes[input.len()..].fill(b' ');
 
+        // No zero/init needed: K1 overwrites every word of these.
         let bm_quote = GpuBuffer::alloc(ctx, words * size_of::<u64>())?;
         let bm_tok = GpuBuffer::alloc(ctx, words * size_of::<u64>())?;
         let escape_info = GpuBuffer::alloc(ctx, words)?;
-        let chunk_quote_counts = GpuBuffer::alloc(ctx, chunks * size_of::<u32>())?;
-        let chunk_token_counts = GpuBuffer::alloc(ctx, chunks * size_of::<u32>())?;
+        // Kernel accumulation targets: establish the documented zero/init
+        // preconditions explicitly (a few bytes per 64 KiB chunk — cheap).
+        let mut chunk_quote_counts = GpuBuffer::alloc(ctx, chunks * size_of::<u32>())?;
+        let mut chunk_token_counts = GpuBuffer::alloc(ctx, chunks * size_of::<u32>())?;
         let mut header = GpuBuffer::alloc(ctx, size_of::<MjHeader>())?;
+        chunk_quote_counts.contents_mut().fill(0);
+        chunk_token_counts.contents_mut().fill(0);
         header.as_mut_slice::<MjHeader>()[0] = MjHeader::new();
 
         Ok(Self {
@@ -331,9 +379,18 @@ impl Stage1Buffers {
         self.header.as_slice::<MjHeader>()[0]
     }
 
-    /// Re-initialize the header for a fresh parse over the same buffers.
-    pub fn reset_header(&mut self) {
+    /// Re-arm the same allocations for a fresh parse: re-establishes every
+    /// zero/init precondition from the struct docs (chunk count buffers
+    /// zero-filled, header back to [`MjHeader::new`]) and drops the token
+    /// buffers (the next parse re-allocates them at its exact token count).
+    /// `input`, the bitmaps and `escape_info` need no reset — K1 overwrites
+    /// them. Cheap: 4 bytes per 64 KiB chunk plus the 64-byte header.
+    pub fn reset_for_reuse(&mut self) {
+        self.chunk_quote_counts.contents_mut().fill(0);
+        self.chunk_token_counts.contents_mut().fill(0);
         self.header.as_mut_slice::<MjHeader>()[0] = MjHeader::new();
+        self.tok_pos = None;
+        self.tok_kind = None;
     }
 
     /// Apply the exact token count read from [`MjHeader::token_total`]

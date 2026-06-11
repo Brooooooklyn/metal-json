@@ -3,7 +3,9 @@
 //!   native-ulong expectations, over adversarial bit patterns;
 //! - `CommandBatch`: multi-dispatch encoding order within one serial encoder;
 //! - `Stage` / `TestHarness` plumbing;
-//! - `Stage1Buffers` size formulas and exact token allocation;
+//! - `Stage1Buffers` size formulas, exact token allocation, and the
+//!   poisoned-buffer reset (the zero/init preconditions are an explicit
+//!   invariant, not an allocator accident);
 //! - `stage1_vs_reference` (feature `cpu-reference`): the M2 differential
 //!   suite — GPU K1-K5 vs the scalar oracle on the corpus, the full
 //!   JSONTestSuite, adversarial fixtures (backslash/quote walls, seam and
@@ -17,6 +19,7 @@
 #[cfg(feature = "cpu-reference")]
 mod common;
 
+use metal_json::gpu::Stage1;
 use metal_json::metal::{Binding, Dispatch, MjHeader, MjParams};
 use metal_json::stage::{CHUNK_BYTES, CHUNK_WORDS, Stage, Stage1Buffers, TestHarness, WORD_BYTES};
 
@@ -397,9 +400,78 @@ fn stage1_buffers_apply_exact_token_count() {
     assert_eq!(bufs.tok_pos.as_ref().unwrap().len(), 0);
     assert_eq!(bufs.tok_kind.as_ref().unwrap().len(), 0);
 
-    // reset_header re-arms the same buffers for a fresh parse.
-    bufs.reset_header();
+    // reset_for_reuse re-arms the same buffers for a fresh parse: header
+    // re-initialized, chunk counts re-zeroed, token buffers dropped.
+    bufs.reset_for_reuse();
     assert_eq!(bufs.read_header(), MjHeader::new());
+    assert!(bufs.tok_pos.is_none(), "reset must drop tok_pos");
+    assert!(bufs.tok_kind.is_none(), "reset must drop tok_kind");
+    assert!(
+        bufs.chunk_quote_counts.contents().iter().all(|&b| b == 0),
+        "reset must zero chunk_quote_counts"
+    );
+    assert!(
+        bufs.chunk_token_counts.contents().iter().all(|&b| b == 0),
+        "reset must zero chunk_token_counts"
+    );
+}
+
+/// The Stage1Buffers zero/init preconditions are an explicit invariant, not
+/// an allocator accident: scribble 0xDEADBEEF over every buffer a kernel
+/// accumulates into (the chunk count buffers, the header) — and over the
+/// no-precondition buffers for good measure — then `reset_for_reuse()` and
+/// run the full stage-1 pipeline on the poisoned-then-reset buffers. The
+/// output must be bit-identical to a run on freshly constructed buffers.
+/// Pins the invariant against allocator behavior (the planned M5 buffer
+/// pool hands out dirty buffers).
+#[test]
+fn poisoned_buffers_reset_to_a_fresh_parse_state() {
+    let Some(harness) = harness_or_skip("poisoned_buffers_reset_to_a_fresh_parse_state") else {
+        return;
+    };
+    let ctx = harness.ctx();
+    let stage1 = Stage1::new();
+
+    // A known document spanning several spine chunks (so every entry of the
+    // per-chunk count buffers is in play), with strings and escapes so the
+    // quote partials are nonzero everywhere.
+    let mut input = b"[".to_vec();
+    let mut i = 0usize;
+    while input.len() < 2 * CHUNK_BYTES + 4096 {
+        input.extend_from_slice(format!(r#"{{"k{i}":"v\"{i}\\","n":{i}}},"#).as_bytes());
+        i += 1;
+    }
+    input.pop(); // trailing comma
+    input.push(b']');
+
+    let fresh = stage1.run(ctx, &input).expect("fresh run");
+    assert_eq!(fresh.error, None, "the known document is stage-1 clean");
+    assert!(fresh.token_total > 0);
+    assert!(fresh.quote_total > 0);
+
+    let mut bufs = Stage1Buffers::new(ctx, &input).unwrap();
+    assert!(bufs.chunks() >= 3, "input must span several chunks");
+    // Poison every kernel accumulation target...
+    bufs.chunk_quote_counts
+        .as_mut_slice::<u32>()
+        .fill(0xDEAD_BEEF);
+    bufs.chunk_token_counts
+        .as_mut_slice::<u32>()
+        .fill(0xDEAD_BEEF);
+    bufs.header.as_mut_slice::<u32>().fill(0xDEAD_BEEF);
+    // ...and the no-precondition buffers, which K1 must fully overwrite.
+    bufs.bm_quote.contents_mut().fill(0xEF);
+    bufs.bm_tok.contents_mut().fill(0xEF);
+    bufs.escape_info.contents_mut().fill(0xEF);
+
+    bufs.reset_for_reuse();
+    let (after_reset, _) = stage1
+        .run_with_buffers(ctx, &mut bufs)
+        .expect("run on poisoned-then-reset buffers");
+    assert_eq!(
+        after_reset, fresh,
+        "poisoned-then-reset buffers must reproduce a fresh run bit-for-bit"
+    );
 }
 
 /// Oversized inputs must fail with the structured error, before any
@@ -425,11 +497,13 @@ fn stage1_buffers_reject_oversized_input() {
 /// UTF-8 → valve → K2/K4 spines → K3 mask → K5 scatter) vs the scalar
 /// oracle (`reference::stage1_classify` + `reference::stage2_tokens`) on
 /// identical inputs, diffing the quote bitmap, the token bitmap, the token
-/// stream (positions + kinds), the totals and the error word.
+/// stream (positions + kinds), the totals and the error word on clean
+/// inputs — and, on rejected inputs (UTF-8 / odd quotes), error parity
+/// plus the empty-token-outputs rejection contract (see `diff`).
 #[cfg(feature = "cpu-reference")]
 mod stage1_vs_reference {
     use metal_json::Error;
-    use metal_json::gpu::{ERR_STRING, ERR_UTF8, Stage1};
+    use metal_json::gpu::{ERR_STRING, ERR_UTF8, Stage1, Stage1Output};
     use metal_json::metal::MetalContext;
     use metal_json::reference::{stage1_classify, stage2_tokens};
     use metal_json::stage::{CHUNK_BYTES, WORD_BYTES};
@@ -447,15 +521,46 @@ mod stage1_vs_reference {
         OddQuotes,
     }
 
-    /// Run both backends on `input` and require bit-for-bit agreement;
-    /// returns the (agreed) stage-1 verdict.
+    /// Run both backends on `input` and require agreement; returns the
+    /// (agreed) stage-1 verdict.
+    ///
+    /// Clean inputs are compared bit-for-bit (bitmaps, token stream,
+    /// totals). Rejected inputs (UTF-8 / odd quotes) follow the narrowed
+    /// stage-1 contract instead: both sides must agree on WHICH inputs
+    /// error and at which offset/code (verdict parity — what makes the
+    /// narrowing sound: a kernel bug that only manifests on rejected
+    /// inputs cannot affect parser output, because the parser aborts), and
+    /// the GPU must return EMPTY token outputs ([`assert_rejected`]). On
+    /// odd-quote inputs the reference still produces bitmaps, so the K1
+    /// quote bitmap and K2 total are additionally compared there.
     fn diff(stage1: &Stage1, ctx: &MetalContext, input: &[u8], label: &str) -> Stage1Verdict {
         let got = stage1
             .run(ctx, input)
             .unwrap_or_else(|e| panic!("{label}: GPU stage 1 failed: {e}"));
         match stage1_classify(input) {
             Ok(bitmaps) => {
+                // Both sides produce the quote bitmap regardless of the
+                // odd-quote verdict (it is what the verdict derives from).
                 assert_eq!(got.quote_real, bitmaps.quote_real, "{label}: quote bitmap");
+                let quote_total: u64 = bitmaps
+                    .quote_real
+                    .iter()
+                    .map(|w| u64::from(w.count_ones()))
+                    .sum();
+                assert_eq!(got.quote_total, quote_total, "{label}: quote total");
+
+                if quote_total % 2 == 1 {
+                    // Odd quotes: K2 packs MJ_ERR_STRING at offset input_len
+                    // (stage 3 refines it in M3) and the input is rejected.
+                    assert_eq!(
+                        got.error_offset_code(),
+                        Some((input.len() as u64, ERR_STRING)),
+                        "{label}: odd-quote error word"
+                    );
+                    assert_rejected(&got, label);
+                    return Stage1Verdict::OddQuotes;
+                }
+                assert_eq!(got.error, None, "{label}: spurious error word");
 
                 let tokens = stage2_tokens(&bitmaps, input);
                 let want_pos: Vec<u32> = tokens.iter().map(|t| t.pos).collect();
@@ -471,27 +576,7 @@ mod stage1_vs_reference {
                     want_bitmap[t.pos as usize / 64] |= 1u64 << (t.pos % 64);
                 }
                 assert_eq!(got.tokens, want_bitmap, "{label}: token bitmap");
-
-                let quote_total: u64 = bitmaps
-                    .quote_real
-                    .iter()
-                    .map(|w| u64::from(w.count_ones()))
-                    .sum();
-                assert_eq!(got.quote_total, quote_total, "{label}: quote total");
-
-                if quote_total % 2 == 1 {
-                    // Odd quotes: K2 packs MJ_ERR_STRING at offset input_len
-                    // (stage 3 refines it in M3).
-                    assert_eq!(
-                        got.error_offset_code(),
-                        Some((input.len() as u64, ERR_STRING)),
-                        "{label}: odd-quote error word"
-                    );
-                    Stage1Verdict::OddQuotes
-                } else {
-                    assert_eq!(got.error, None, "{label}: spurious error word");
-                    Stage1Verdict::Clean
-                }
+                Stage1Verdict::Clean
             }
             Err(Error::Utf8 { offset }) => {
                 let (got_offset, code) = got
@@ -499,10 +584,29 @@ mod stage1_vs_reference {
                     .unwrap_or_else(|| panic!("{label}: missing UTF-8 error (want {offset})"));
                 assert_eq!(code, ERR_UTF8, "{label}: error code");
                 assert_eq!(got_offset, offset, "{label}: UTF-8 error offset");
+                assert_rejected(&got, label);
                 Stage1Verdict::Utf8
             }
             Err(other) => panic!("{label}: unexpected reference error {other:?}"),
         }
+    }
+
+    /// The stage-1 rejection contract on the GPU side: a rejected input
+    /// (UTF-8 / odd quotes) produces NO token outputs — K5 is skipped and
+    /// downstream stages never see tokens for it.
+    fn assert_rejected(got: &Stage1Output, label: &str) {
+        assert!(
+            got.tok_pos.is_empty(),
+            "{label}: rejected input must produce no tok_pos"
+        );
+        assert!(
+            got.tok_kind.is_empty(),
+            "{label}: rejected input must produce no tok_kind"
+        );
+        assert_eq!(
+            got.token_total, 0,
+            "{label}: rejected input must report token_total 0"
+        );
     }
 
     fn run_corpus(test: &str, cases: &[(String, Vec<u8>)]) {

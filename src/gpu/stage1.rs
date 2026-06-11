@@ -18,8 +18,11 @@
 //!                                 partials
 //!      K4  spine_token_scan       1 threadgroup: chunk token carries +
 //!                                 token_total
-//!   ── commit, wait: CPU reads the header, allocates tok_pos/tok_kind at
-//!      exactly token_total entries ──
+//!   ── commit, wait: CPU reads the header. If it carries an error
+//!      (invalid UTF-8 / odd quote count) the input is REJECTED here:
+//!      CB2 never runs and the token outputs stay empty (see
+//!      [`Stage1Output`]). Otherwise the CPU allocates tok_pos/tok_kind
+//!      at exactly token_total entries ──
 //! CB2: K5  token_scatter          1 threadgroup / chunk: writes tok_pos +
 //!                                 tok_kind by globally dense rank
 //!   ── commit, wait ──
@@ -57,6 +60,19 @@ pub const ERR_STRING: u32 = 6;
 /// Bitmap words are `u64` read straight from the GPU `uint2 (lo, hi)`
 /// buffers — identical layouts on little-endian — and diff directly against
 /// the reference `Bitmaps` (`crate::reference::Bitmaps`) vectors.
+///
+/// # Rejection contract
+///
+/// When [`error`](Self::error) is `Some`, stage 1 has **rejected** the
+/// input (invalid UTF-8 or an odd quote count) and downstream outputs are
+/// never produced: K5 is skipped, [`tok_pos`](Self::tok_pos) and
+/// [`tok_kind`](Self::tok_kind) are empty, and
+/// [`token_total`](Self::token_total) is 0 — mirroring how the eventual
+/// parser aborts on stage-1 errors. The bitmaps, `quote_total` and
+/// `carry_overflow_count` are still returned (CB1 produced them before the
+/// error was observable; the valve tests assert the repaired quote bitmap
+/// on such inputs), but consumers must treat a rejected input as having no
+/// token stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stage1Output {
     /// Escape-resolved real-quote bitmap (one u64 per 64-byte word).
@@ -64,12 +80,14 @@ pub struct Stage1Output {
     /// Token bitmap: `(candidates & !in_string & !quote_real) | quote_real`.
     pub tokens: Vec<u64>,
     /// Token byte positions, document order, exactly `token_total` entries.
+    /// Empty when [`error`](Self::error) is `Some` (rejection contract).
     pub tok_pos: Vec<u32>,
     /// Token kinds; `reference::TokenKind` discriminants (a test pins them).
+    /// Empty when [`error`](Self::error) is `Some` (rejection contract).
     pub tok_kind: Vec<u8>,
     /// Total real quotes (odd ⇒ unterminated string ⇒ `error` is set).
     pub quote_total: u64,
-    /// Total tokens (`== tok_pos.len()`).
+    /// Total tokens (`== tok_pos.len()`; 0 on rejected inputs).
     pub token_total: u64,
     /// Words whose escape look-back hit the 4096-byte cap (valve engaged).
     pub carry_overflow_count: u64,
@@ -113,7 +131,10 @@ impl Stage1 {
     }
 
     /// Run stage 1 over `input` on freshly allocated buffers and read the
-    /// results back. See the module docs for the CB1/CB2 shape.
+    /// results back. See the module docs for the CB1/CB2 shape and
+    /// [`Stage1Output`] for the rejection contract: a stage-1 error (invalid
+    /// UTF-8, odd quotes) means the input is rejected — K5 is skipped and
+    /// the token outputs are empty.
     ///
     /// # Errors
     ///
@@ -127,15 +148,37 @@ impl Stage1 {
 
     /// [`run`](Self::run), additionally returning the summed GPU execution
     /// time of CB1 + CB2 in seconds (per-command-buffer `GPUEndTime −
-    /// GPUStartTime`; zero when the device reports no timestamps). Coarse
-    /// whole-stage timing for the manual sanity test in `tests/kernels.rs`;
-    /// per-kernel breakdowns are the M5 `timing` feature's job.
+    /// GPUStartTime`; zero when the device reports no timestamps; CB1 only
+    /// when the input is rejected). Coarse whole-stage timing for the
+    /// manual sanity test in `tests/kernels.rs`; per-kernel breakdowns are
+    /// the M5 `timing` feature's job.
     ///
     /// # Errors
     ///
     /// As [`run`](Self::run).
     pub fn run_timed(&self, ctx: &MetalContext, input: &[u8]) -> Result<(Stage1Output, f64)> {
         let mut bufs = Stage1Buffers::new(ctx, input)?;
+        self.run_with_buffers(ctx, &mut bufs)
+    }
+
+    /// [`run_timed`](Self::run_timed) over caller-prepared buffers (the
+    /// path `tests/kernels.rs` uses to prove the poisoned-buffer reset).
+    ///
+    /// `bufs` must satisfy the [`Stage1Buffers`] zero/init preconditions —
+    /// i.e. be freshly constructed or re-armed with
+    /// [`Stage1Buffers::reset_for_reuse`]. Running twice on the same
+    /// buffers without a reset accumulates into stale chunk counts and a
+    /// stale header and produces garbage.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub fn run_with_buffers(
+        &self,
+        ctx: &MetalContext,
+        bufs: &mut Stage1Buffers,
+    ) -> Result<(Stage1Output, f64)> {
+        let input_len = bufs.input_len();
         let words = bufs.words();
         let chunks = bufs.chunks();
         if words == 0 {
@@ -165,12 +208,12 @@ impl Stage1 {
         }
 
         let word_params = MjParams {
-            input_len: input.len() as u64,
+            input_len: input_len as u64,
             element_count: words as u64,
             ..Default::default()
         };
         let chunk_params = MjParams {
-            input_len: input.len() as u64,
+            input_len: input_len as u64,
             element_count: chunks as u64,
             ..Default::default()
         };
@@ -219,16 +262,38 @@ impl Stage1 {
             gpu_seconds += batch.commit_and_wait_timed()?;
         }
 
-        // --- CB1 → CPU sync point: exact-size token allocation -------------
+        // --- CB1 → CPU sync point ------------------------------------------
         let header = bufs.read_header();
+
+        // Rejection contract (see Stage1Output): CB1 detected invalid UTF-8
+        // or an odd quote count, so the input is rejected and downstream
+        // outputs are never produced — skip the token allocation, K5/CB2 and
+        // the token readback entirely. The bitmaps and totals CB1 already
+        // wrote are returned for the valve/bitmap tests; token outputs stay
+        // empty (token_total = 0), mirroring how the eventual parser aborts.
+        if let Some((offset, code)) = header.first_error() {
+            let output = Stage1Output {
+                quote_real: bufs.bm_quote.as_slice::<u64>().to_vec(),
+                tokens: bufs.bm_tok.as_slice::<u64>().to_vec(),
+                tok_pos: Vec::new(),
+                tok_kind: Vec::new(),
+                quote_total: header.quote_total,
+                token_total: 0,
+                carry_overflow_count: header.carry_overflow_count,
+                error: Some((offset << 32) | u64::from(code)),
+                input_len,
+            };
+            return Ok((output, gpu_seconds));
+        }
+
+        // --- exact-size token allocation ------------------------------------
         let token_total = usize::try_from(header.token_total).expect("token_total fits usize");
-        if token_total > input.len() {
+        if token_total > input_len {
             // A token occupies at least one input byte; anything else means
             // the GPU pipeline corrupted its own header.
             return Err(Error::CommandBuffer {
                 message: format!(
-                    "stage1 header reports {token_total} tokens for {} input bytes",
-                    input.len()
+                    "stage1 header reports {token_total} tokens for {input_len} input bytes"
                 ),
             });
         }
@@ -269,10 +334,9 @@ impl Stage1 {
             quote_total: header.quote_total,
             token_total: header.token_total,
             carry_overflow_count: header.carry_overflow_count,
-            error: header
-                .first_error()
-                .map(|(off, code)| (off << 32) | u64::from(code)),
-            input_len: input.len(),
+            // No error: the rejection early-out above already returned.
+            error: None,
+            input_len,
         };
         Ok((output, gpu_seconds))
     }
@@ -389,18 +453,23 @@ mod tests {
     }
 
     /// Odd total quote count must set the error word (UnterminatedString
-    /// surfaces in M3; stage 1 packs MJ_ERR_STRING at offset input_len).
+    /// surfaces in M3; stage 1 packs MJ_ERR_STRING at offset input_len) and
+    /// REJECT the input: K5 is skipped, so no token outputs are produced.
     #[test]
-    fn odd_quote_total_sets_the_error_word() {
-        let Some(ctx) = ctx_or_skip("odd_quote_total_sets_the_error_word") else {
+    fn odd_quote_total_sets_the_error_word_and_rejects_the_input() {
+        let Some(ctx) = ctx_or_skip("odd_quote_total_sets_the_error_word_and_rejects_the_input")
+        else {
             return;
         };
         let out = run_stage1(&ctx, b"\"abc").unwrap();
         assert_eq!(out.quote_total, 1);
         assert_eq!(out.error_offset_code(), Some((4, ERR_STRING)));
-        // The unpaired quote is still a lone QuoteOpen token.
-        assert_eq!(out.tok_pos, vec![0]);
-        assert_eq!(out.tok_kind, vec![6]);
+        // The unpaired quote is still visible in the CB1 quote bitmap...
+        assert_eq!(out.quote_real, vec![0b1]);
+        // ...but the rejection contract keeps the token outputs empty.
+        assert!(out.tok_pos.is_empty());
+        assert!(out.tok_kind.is_empty());
+        assert_eq!(out.token_total, 0);
     }
 
     /// Invalid UTF-8 reports the offset of the first byte of the first
