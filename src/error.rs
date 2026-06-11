@@ -65,6 +65,11 @@ pub enum Error {
     #[error("failed to allocate a GPU buffer of {bytes} bytes")]
     BufferAlloc { bytes: usize },
 
+    /// Caller-provided memory does not satisfy zero-copy layout requirements
+    /// (page alignment, page-multiple length within addressable range).
+    #[error("invalid buffer layout for zero-copy wrapping: {message}")]
+    InvalidBufferLayout { message: String },
+
     /// A committed command buffer completed with an error.
     #[error("GPU command buffer failed: {message}")]
     CommandBuffer { message: String },

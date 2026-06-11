@@ -3,15 +3,34 @@
 //! GpuBuffer → dispatch → exact CPU readback. Run with
 //! `MTL_SHADER_VALIDATION=1` in CI.
 
-use metal_json::metal::{Dispatch, GpuBuffer, MetalContext, MjParams, Pipeline};
+use metal_json::metal::{Binding, Dispatch, GpuBuffer, MetalContext, MjParams, Pipeline};
 
 /// Deliberately not a multiple of THREADGROUP_SIZE (256) to exercise the
 /// per-thread `element_count` bound check and non-uniform threadgroups.
 const N: usize = 4096 + 37;
 
+/// GPU gating: in environments without a Metal device (containers, sandboxed
+/// CI), skip with a loud message instead of failing — unless
+/// `METAL_JSON_REQUIRE_GPU=1` (set in our CI) makes a missing device a hard
+/// error, so the only GPU evidence cannot silently disappear.
+fn ctx_or_skip(test: &str) -> Option<MetalContext> {
+    match MetalContext::new() {
+        Ok(ctx) => Some(ctx),
+        Err(err) => {
+            if std::env::var_os("METAL_JSON_REQUIRE_GPU").is_some_and(|v| v == "1") {
+                panic!("METAL_JSON_REQUIRE_GPU=1 but no usable Metal device: {err}");
+            }
+            eprintln!("SKIP {test}: no usable Metal device here ({err})");
+            None
+        }
+    }
+}
+
 #[test]
 fn smoke_add_exact() {
-    let ctx = MetalContext::new().expect("MetalContext::new");
+    let Some(ctx) = ctx_or_skip("smoke_add_exact") else {
+        return;
+    };
     let pipeline = Pipeline::new(&ctx, "smoke_add").expect("pipeline smoke_add");
 
     let a_host: Vec<u32> = (0..N as u32).collect();
@@ -19,7 +38,7 @@ fn smoke_add_exact() {
 
     let mut a = GpuBuffer::alloc(&ctx, N * size_of::<u32>()).unwrap();
     let mut b = GpuBuffer::alloc(&ctx, N * size_of::<u32>()).unwrap();
-    let out = GpuBuffer::alloc(&ctx, N * size_of::<u32>()).unwrap();
+    let mut out = GpuBuffer::alloc(&ctx, N * size_of::<u32>()).unwrap();
     a.write_from(&a_host);
     b.write_from(&b_host);
 
@@ -30,7 +49,7 @@ fn smoke_add_exact() {
     };
     ctx.dispatch(
         &pipeline,
-        &[&a, &b, &out],
+        &[Binding::Read(&a), Binding::Read(&b), Binding::ReadWrite(&mut out)],
         Some(&params),
         Dispatch::Threads(N),
     )
@@ -48,7 +67,9 @@ fn smoke_add_exact() {
 
 #[test]
 fn smoke_popcount64_exact() {
-    let ctx = MetalContext::new().expect("MetalContext::new");
+    let Some(ctx) = ctx_or_skip("smoke_popcount64_exact") else {
+        return;
+    };
     let pipeline = Pipeline::new(&ctx, "smoke_popcount64").expect("pipeline smoke_popcount64");
 
     // Mix edge cases with a deterministic pseudo-random pattern.
@@ -64,7 +85,7 @@ fn smoke_popcount64_exact() {
         .collect();
 
     let mut input = GpuBuffer::alloc(&ctx, N * size_of::<u64>()).unwrap();
-    let out = GpuBuffer::alloc(&ctx, N * size_of::<u32>()).unwrap();
+    let mut out = GpuBuffer::alloc(&ctx, N * size_of::<u32>()).unwrap();
     input.write_from(&in_host);
 
     let params = MjParams {
@@ -74,7 +95,7 @@ fn smoke_popcount64_exact() {
     };
     ctx.dispatch(
         &pipeline,
-        &[&input, &out],
+        &[Binding::Read(&input), Binding::ReadWrite(&mut out)],
         Some(&params),
         Dispatch::Threads(N),
     )

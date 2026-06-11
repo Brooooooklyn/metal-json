@@ -64,11 +64,28 @@ impl GpuBuffer {
         ptr: NonNull<u8>,
         len: usize,
     ) -> Result<Self> {
-        debug_assert!(
-            (ptr.as_ptr() as usize).is_multiple_of(PAGE_SIZE),
-            "GpuBuffer::from_page_aligned: pointer must be 16384-byte aligned"
-        );
-        let wrapped_len = len.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+        // Layout problems are checked at runtime and reported as structured
+        // errors; the `unsafe` contract covers only what cannot be checked
+        // (allocation validity, lifetime, and GPU/CPU mutation exclusion).
+        if !(ptr.as_ptr() as usize).is_multiple_of(PAGE_SIZE) {
+            return Err(Error::InvalidBufferLayout {
+                message: format!(
+                    "pointer {:p} is not {PAGE_SIZE}-byte page-aligned",
+                    ptr.as_ptr()
+                ),
+            });
+        }
+        let wrapped_len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or_else(|| Error::InvalidBufferLayout {
+                message: format!("length {len} overflows when rounded up to a page multiple"),
+            })?
+            .max(PAGE_SIZE);
+        if wrapped_len > isize::MAX as usize {
+            return Err(Error::InvalidBufferLayout {
+                message: format!("wrapped length {wrapped_len} exceeds isize::MAX"),
+            });
+        }
         // SAFETY: caller upholds the invariants documented above; passing no
         // deallocator means Metal never frees the memory.
         let raw = unsafe {
@@ -94,9 +111,10 @@ impl GpuBuffer {
 
     /// CPU view of the buffer contents.
     ///
-    /// Only call when no command buffer writing to this buffer is in flight
-    /// (the M0 dispatch helper always waits for completion, so this is safe
-    /// by construction for now).
+    /// Soundness: a kernel that writes this buffer must bind it
+    /// [`Binding::ReadWrite`](super::Binding::ReadWrite), which takes
+    /// `&mut GpuBuffer` — the borrow checker therefore guarantees no slice
+    /// returned here is live across a dispatch that mutates the buffer.
     pub fn contents(&self) -> &[u8] {
         // SAFETY: shared-storage buffer; `contents()` is valid for at least
         // `length()` >= `self.len` bytes for the lifetime of `self.raw`.

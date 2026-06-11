@@ -55,6 +55,30 @@ pub enum Dispatch {
     Threadgroups(usize),
 }
 
+/// How a kernel accesses a bound buffer.
+///
+/// A buffer the kernel writes must be bound [`ReadWrite`](Binding::ReadWrite),
+/// which takes `&mut GpuBuffer` — the exclusive borrow statically rules out
+/// any live CPU slice view (`contents`/`as_slice`) across the dispatch that
+/// mutates it. The binding mode must match what the kernel actually does;
+/// kernels and their call sites both live in this crate, so a mismatch is an
+/// internal bug, not caller error.
+pub enum Binding<'a> {
+    /// The kernel only reads this buffer.
+    Read(&'a GpuBuffer),
+    /// The kernel may write this buffer.
+    ReadWrite(&'a mut GpuBuffer),
+}
+
+impl Binding<'_> {
+    fn buffer(&self) -> &GpuBuffer {
+        match self {
+            Binding::Read(b) => b,
+            Binding::ReadWrite(b) => b,
+        }
+    }
+}
+
 impl MetalContext {
     /// Encode and run one compute dispatch synchronously:
     /// command buffer → encoder → pipeline + buffers (+ optional `MjParams`
@@ -67,7 +91,7 @@ impl MetalContext {
     pub fn dispatch(
         &self,
         pipeline: &Pipeline,
-        buffers: &[&GpuBuffer],
+        bindings: &[Binding<'_>],
         params: Option<&MjParams>,
         work: Dispatch,
     ) -> Result<()> {
@@ -81,17 +105,17 @@ impl MetalContext {
             })?;
 
         encoder.setComputePipelineState(pipeline.state());
-        for (index, buffer) in buffers.iter().enumerate() {
+        for (index, binding) in bindings.iter().enumerate() {
             // SAFETY: the buffer is retained by the caller for the duration
             // of this synchronous call; offset 0 is always in bounds.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), 0, index) };
+            unsafe { encoder.setBuffer_offset_atIndex(Some(binding.buffer().raw()), 0, index) };
         }
         if let Some(params) = params {
             let ptr = NonNull::from(params).cast::<c_void>();
             // SAFETY: `ptr` points at a live MjParams for the duration of the
             // call; setBytes copies the data into the command stream.
             unsafe {
-                encoder.setBytes_length_atIndex(ptr, size_of::<MjParams>(), buffers.len());
+                encoder.setBytes_length_atIndex(ptr, size_of::<MjParams>(), bindings.len());
             }
         }
 

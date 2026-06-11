@@ -20,5 +20,13 @@ jobs:
         run: cargo test --workspace
         env:
           MTL_SHADER_VALIDATION: "1"
+          # CI runners must have a Metal device; never let GPU tests
+          # silently skip here.
+          METAL_JSON_REQUIRE_GPU: "1"
+      - name: Test (runtime-shaders fallback path)
+        run: cargo test -p metal-json --features runtime-shaders
+        env:
+          MTL_SHADER_VALIDATION: "1"
+          METAL_JSON_REQUIRE_GPU: "1"
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
