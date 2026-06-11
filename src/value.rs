@@ -470,6 +470,11 @@ mod tests {
 
     /// The worked example of docs/tape-format.md:
     /// `{"a":[1,2.5],"b":"x\n"}` (the `\n` already unescaped).
+    ///
+    /// The builder packs records densely, while the pipeline allocates by
+    /// raw-length prefix sum; the tape words still match the doc exactly
+    /// because no escape precedes the last string ("a" and "b" are
+    /// escape-free, so dense and raw offsets coincide: 0, 6, 12).
     fn worked_example() -> Document {
         let mut b = TapeBuilder::new();
         b.open_object();

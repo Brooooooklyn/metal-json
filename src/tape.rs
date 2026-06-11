@@ -389,6 +389,16 @@ impl std::fmt::Debug for TapeBuffer {
 /// convenience (content may itself contain NUL from `\u0000`, which is why
 /// the explicit length exists). Like [`TapeBuffer`], the backing store is
 /// encapsulated so it can move into a GPU buffer later without API change.
+///
+/// Records can be placed two ways:
+///
+/// - [`append_record`](Self::append_record) packs densely (handy for
+///   hand-built test tapes);
+/// - [`append_record_at`](Self::append_record_at) /
+///   [`pad_to`](Self::pad_to) place records at offsets allocated by the
+///   pipeline's raw-length prefix sum (see `docs/tape-format.md`), where
+///   escapes that shrink a string leave a **gap** before the next record.
+///   The reference backend zero-fills gaps deterministically.
 #[derive(Clone, Default)]
 pub struct StringBuffer {
     bytes: Vec<u8>,
@@ -430,6 +440,44 @@ impl StringBuffer {
         self.bytes.extend_from_slice(content);
         self.bytes.push(0);
         offset
+    }
+
+    /// Zero-fill the buffer up to (exactly) `offset` bytes.
+    ///
+    /// Used by the reference pipeline to realize the raw-length prefix-sum
+    /// offset scheme of `docs/tape-format.md`: when an escape shrinks a
+    /// string, the bytes between the end of its record and the start of the
+    /// next allocated slot (or the buffer end) are a gap, zero-filled here
+    /// so the reference output is deterministic. A no-op when the buffer is
+    /// already `offset` bytes long.
+    ///
+    /// # Panics
+    /// If `offset` is smaller than the current length (records are placed in
+    /// document order; padding never moves backwards).
+    pub fn pad_to(&mut self, offset: u64) {
+        let target = usize::try_from(offset).expect("string offset exceeds usize");
+        assert!(
+            target >= self.bytes.len(),
+            "pad_to({target}) would shrink the buffer (len {})",
+            self.bytes.len()
+        );
+        self.bytes.resize(target, 0);
+    }
+
+    /// Append a `[u32 LE length][content][NUL]` record **at** byte `offset`,
+    /// zero-filling any gap between the current buffer end and `offset`,
+    /// and return `offset` (the value to store via [`make_string`]).
+    ///
+    /// This is how the reference pipeline places records at the offsets the
+    /// raw-length prefix sum allocated (gaps appear when escapes shrink an
+    /// earlier string).
+    ///
+    /// # Panics
+    /// As [`pad_to`](Self::pad_to) and
+    /// [`append_record`](Self::append_record).
+    pub fn append_record_at(&mut self, offset: u64, content: &[u8]) -> u64 {
+        self.pad_to(offset);
+        self.append_record(content)
     }
 
     /// Content bytes of the record starting at `offset` (as returned by
@@ -475,7 +523,9 @@ impl StringBuffer {
         self.bytes.is_empty()
     }
 
-    /// Raw buffer contents (records back to back).
+    /// Raw buffer contents (records in document order, with zero-filled
+    /// gaps wherever the offset scheme left room — see
+    /// [`append_record_at`](Self::append_record_at)).
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
@@ -743,6 +793,55 @@ mod tests {
     }
 
     #[test]
+    fn append_record_at_zero_fills_gaps() {
+        let mut buf = StringBuffer::new();
+
+        // First record at 0, no gap.
+        assert_eq!(buf.append_record_at(0, b"ab"), 0);
+        assert_eq!(buf.len(), 7);
+
+        // Next slot allocated at 10 (as if the first string's raw length
+        // were 5): bytes 7..10 are a zero-filled gap.
+        assert_eq!(buf.append_record_at(10, b"c"), 10);
+        assert_eq!(
+            buf.as_bytes(),
+            &[
+                2, 0, 0, 0, b'a', b'b', 0, // record "ab"
+                0, 0, 0, // gap
+                1, 0, 0, 0, b'c', 0, // record "c"
+            ]
+        );
+        // Records decode through the gap.
+        assert_eq!(buf.record_bytes(0), b"ab");
+        assert_eq!(buf.record_str(10), "c");
+
+        // Exact-offset placement (gap of zero bytes) is fine.
+        assert_eq!(buf.append_record_at(16, b""), 16);
+        assert_eq!(buf.len(), 21);
+    }
+
+    #[test]
+    fn pad_to_extends_with_zeros_and_is_idempotent() {
+        let mut buf = StringBuffer::new();
+        buf.append_record(b"x"); // 6 bytes
+        buf.pad_to(9); // trailing gap, e.g. raw len 4 → slot 9
+        assert_eq!(buf.len(), 9);
+        assert_eq!(&buf.as_bytes()[6..], &[0, 0, 0]);
+        // Padding to the current length is a no-op.
+        buf.pad_to(9);
+        assert_eq!(buf.len(), 9);
+        assert_eq!(buf.record_str(0), "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "would shrink the buffer")]
+    fn pad_to_panics_on_backward_offsets() {
+        let mut buf = StringBuffer::new();
+        buf.append_record(b"hello");
+        buf.pad_to(3);
+    }
+
+    #[test]
     fn string_buffer_length_prefix_is_little_endian_u32() {
         let mut buf = StringBuffer::new();
         let content = vec![b'z'; 0x0102]; // 258 bytes: exercises the second LE byte
@@ -766,16 +865,22 @@ mod tests {
     /// The worked example from docs/tape-format.md, word for word and byte
     /// for byte: `{"a":[1,2.5],"b":"x\n"}`. If this test changes, the doc
     /// must change with it (and vice versa).
+    ///
+    /// String record offsets follow the raw-length prefix-sum scheme:
+    /// slot size = raw bytes between the quotes + 5 ("a" → 6 at 0,
+    /// "b" → 6 at 6, "x\n" → raw 3 → 8 at 12). The escape shrinks the last
+    /// record to 7 bytes, so the buffer ends with one zero gap byte.
     #[test]
     fn worked_example_matches_tape_format_doc() {
         let mut tape = TapeBuffer::new();
         let mut strings = StringBuffer::new();
 
         // Build the way the reference pipeline does: placeholders for words
-        // whose payloads are only known once the matching close is seen.
+        // whose payloads are only known once the matching close is seen,
+        // string records placed at prefix-sum-allocated offsets.
         let root = tape.push(0); // [0] placeholder root
         let obj_open = tape.push(0); // [1] placeholder '{'
-        let off_a = strings.append_record(b"a");
+        let off_a = strings.append_record_at(0, b"a"); // raw len 1 → slot 6
         tape.push(make_string(off_a)); // [2] "a"
         let arr_open = tape.push(0); // [3] placeholder '['
         tape.push(make_int64_marker()); // [4] 'l'
@@ -787,10 +892,11 @@ mod tests {
             arr_open,
             make_open(TAG_START_ARRAY, (arr_close + 1) as u32, 2),
         );
-        let off_b = strings.append_record(b"b");
+        let off_b = strings.append_record_at(6, b"b"); // raw len 1 → slot 6
         tape.push(make_string(off_b)); // [9] "b"
-        let off_xn = strings.append_record(b"x\n"); // unescaped: 'x', LF
+        let off_xn = strings.append_record_at(12, b"x\n"); // unescaped: 'x', LF
         tape.push(make_string(off_xn)); // [10] "x\n"
+        strings.pad_to(20); // raw len 3 → slot 8: one trailing gap byte
         let obj_close = tape.push(make_close(TAG_END_OBJECT, obj_open as u32)); // [11] '}'
         tape.set(
             obj_open,
@@ -817,11 +923,13 @@ mod tests {
         ];
         assert_eq!(tape.as_words(), &expected);
 
-        // Exact string buffer bytes as documented.
-        let expected_strings: [u8; 19] = [
+        // Exact string buffer bytes as documented (20 = 6 + 6 + 8; the
+        // last slot holds a 7-byte record + 1 zero gap byte).
+        let expected_strings: [u8; 20] = [
             0x01, 0x00, 0x00, 0x00, 0x61, 0x00, // "a"
             0x01, 0x00, 0x00, 0x00, 0x62, 0x00, // "b"
             0x02, 0x00, 0x00, 0x00, 0x78, 0x0A, 0x00, // "x\n"
+            0x00, // gap: the \n escape shrank 3 raw bytes to 2
         ];
         assert_eq!(strings.as_bytes(), &expected_strings);
 

@@ -320,13 +320,23 @@ mod tests {
     }
 
     #[test]
-    fn string_records_pack_in_document_order() {
+    fn string_records_follow_the_raw_length_offset_scheme() {
         let (tape, strings) = parse(br#"{"k":"v"}"#, &ParserOptions::default()).unwrap();
         // r { "k "v } r
         assert_eq!(tape.len(), 6);
         assert_eq!(strings.record_str(crate::tape::string_offset(tape[2])), "k");
         assert_eq!(strings.record_str(crate::tape::string_offset(tape[3])), "v");
-        assert_eq!(strings.len(), 6 + 6); // two [len u32][1 byte][NUL] records
+        // No escapes: raw_len == content len, so the slots (raw_len + 5)
+        // are gap-free: 6 + 6 bytes.
+        assert_eq!(strings.len(), 6 + 6);
+
+        // With an escape the slot keeps its raw-length size: "k" slot 6,
+        // then `\n` (raw 2) → slot 7, record 6 bytes + 1 zero gap byte.
+        let (tape, strings) = parse(br#"{"k":"\n"}"#, &ParserOptions::default()).unwrap();
+        assert_eq!(crate::tape::string_offset(tape[3]), 6);
+        assert_eq!(strings.record_str(6), "\n");
+        assert_eq!(strings.len(), 6 + 7);
+        assert_eq!(strings.as_bytes()[12], 0); // trailing gap byte
     }
 
     #[test]

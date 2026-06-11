@@ -95,8 +95,33 @@ where this record starts:
   `\u0000`) — that is why the explicit length exists; the trailing NUL is a
   C-string convenience only.
 - Object keys and string values use the same encoding; records appear in the
-  buffer in document order, back to back (the GPU backend may leave gaps
-  between records — only the offsets stored on the tape are meaningful).
+  buffer in document order.
+
+### Offset allocation (pinned policy)
+
+Record offsets are **not** densely packed by unescaped length. They are
+allocated by raw input length, so the GPU can compute every offset from
+token positions alone — *before* any unescaping runs:
+
+```text
+raw_len(s)  = byte count between the quotes of s in the INPUT (escapes
+              still escaped)
+slot(s)     = raw_len(s) + 5          (+5 = 4-byte length prefix + NUL)
+offset(s)   = exclusive prefix sum of slot over strings in document order
+buffer size = Σ slot(s)               (over all strings)
+```
+
+Unescaped content is always ≤ raw content, so a record whose escapes
+shrank it does not fill its slot: the bytes between its NUL and the next
+slot (or the buffer end, for the last string) are a **gap**.
+
+- Gap bytes are **unspecified** in GPU output; consumers must only ever
+  read through the offsets stored on the tape.
+- The CPU reference backend **zero-fills** every gap byte, so its output
+  is deterministic.
+- GPU-vs-reference diff tests therefore compare the tape words (including
+  string offsets) and the per-record bytes (`[length][content][NUL]` at
+  each tape offset) — never raw gap bytes.
 
 ## Numbers
 
@@ -122,6 +147,18 @@ Input document (23 bytes of JSON text):
 The value string contains the two source characters `\` `n`; its unescaped
 content is `x` followed by a line feed (2 bytes).
 
+String slot allocation (raw-length prefix sum):
+
+| string | raw bytes between quotes | raw_len | slot = raw_len + 5 | offset |
+|---|---|---|---|---|
+| `"a"` | `a` | 1 | 6 | 0 |
+| `"b"` | `b` | 1 | 6 | 6 |
+| `"x\n"` | `x` `\` `n` | 3 | 8 | 12 |
+
+Buffer size = 6 + 6 + 8 = **20 bytes**. The last record unescapes to 2
+content bytes, so it occupies only 7 of its 8 slot bytes — its slot ends
+with 1 gap byte (zero-filled by the reference backend).
+
 ### Tape (13 words)
 
 | idx | word (hex) | tag | decoded payload |
@@ -140,7 +177,7 @@ content is `x` followed by a line feed (2 bytes).
 | 11 | `0x7D00_0000_0000_0001` | `}` | matching `{` is at index 1 |
 | 12 | `0x7200_0000_0000_0000` | `r` | payload 0 (points back at index 0) |
 
-### String buffer (19 bytes)
+### String buffer (20 bytes)
 
 | offset | bytes (hex) | meaning |
 |---|---|---|
@@ -154,12 +191,19 @@ content is `x` followed by a line feed (2 bytes).
 | 16 | `78` | `x` |
 | 17 | `0A` | line feed — the `\n` escape, resolved |
 | 18 | `00` | NUL |
+| 19 | `00` | gap (slot is 8 bytes, record used 7; zero in the reference, unspecified on the GPU) |
 
 ## Notes / deviations
 
-- **None forced so far.** Word encoding, container payloads, count
-  saturation, string records, number markers and tag characters all follow
-  simdjson's documented tape layout.
+- Word encoding, container payloads, count saturation, string record
+  encoding, number markers and tag characters all follow simdjson's
+  documented tape layout.
+- **String record offset allocation** deviates: simdjson packs records
+  densely as its sequential parse writes them; format v1 allocates slots by
+  the raw-length prefix sum (see [Offset allocation](#offset-allocation-pinned-policy))
+  so every offset is computable in parallel from token positions alone,
+  before unescaping. Consumers are unaffected — they only ever read through
+  the offsets stored on the tape.
 - Pinned interpretation: simdjson's docs describe `tape[0]`'s payload as
   pointing "one past the last node", which in its own worked example equals
   the index of the final `r` word. Format v1 pins it to exactly **the index

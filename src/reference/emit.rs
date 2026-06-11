@@ -9,8 +9,13 @@
 //! patched.
 //!
 //! Layout produced is tape format v1 exactly as `docs/tape-format.md`
-//! specifies; string records are packed back to back in document order
-//! (the offsets here are what stage 6 precomputed).
+//! specifies; string records land at the offsets stage 6 precomputed (the
+//! exclusive prefix sum of `raw_len + 5` in document order — the K7 scan).
+//! When an escape shrank a string, the slack before the next slot (and
+//! after the last record) is a **gap**: the reference zero-fills every gap
+//! byte so its output is deterministic, the total buffer size being the
+//! full `Σ (raw_len + 5)`. GPU gap bytes are unspecified; kernel diff
+//! tests compare per-record bytes + tape offsets only.
 
 use super::scalars::{ParsedScalar, ScalarValue};
 use super::strings::UnescapedString;
@@ -18,9 +23,10 @@ use super::structure::Stage4Output;
 use super::tokens::{Token, TokenKind};
 use super::validate::Stage3Output;
 use crate::tape::{
-    StringBuffer, TAG_END_ARRAY, TAG_END_OBJECT, TAG_START_ARRAY, TAG_START_OBJECT, TapeBuffer,
-    double_bits, int64_bits, make_close, make_double_marker, make_false, make_final_root,
-    make_int64_marker, make_null, make_open, make_root, make_string, make_true, make_uint64_marker,
+    STRING_RECORD_HEADER_BYTES, STRING_RECORD_TRAILER_BYTES, StringBuffer, TAG_END_ARRAY,
+    TAG_END_OBJECT, TAG_START_ARRAY, TAG_START_OBJECT, TapeBuffer, double_bits, int64_bits,
+    make_close, make_double_marker, make_false, make_final_root, make_int64_marker, make_null,
+    make_open, make_root, make_string, make_true, make_uint64_marker,
 };
 
 /// Assemble the final `(tape, string buffer)` pair from the outputs of
@@ -67,8 +73,17 @@ pub fn emit_tape(
         tape_pos[partner_token]
     };
 
+    // Total string-buffer size: Σ (raw_len + 5) — equivalently, one past
+    // the last allocated slot. (On the GPU this is the K7 scan total.)
+    let stringbuf_size = strings.last().map_or(0, |record| {
+        record.record_offset
+            + (STRING_RECORD_HEADER_BYTES + record.raw_len as usize + STRING_RECORD_TRAILER_BYTES)
+                as u64
+    });
+
     let mut tape = TapeBuffer::with_capacity(running as usize + 1);
-    let mut stringbuf = StringBuffer::new();
+    let mut stringbuf =
+        StringBuffer::with_capacity(usize::try_from(stringbuf_size).expect("stringbuf size"));
     tape.push(make_root(final_root_index));
 
     let mut next_scalar = scalars.iter();
@@ -105,8 +120,9 @@ pub fn emit_tape(
             TokenKind::QuoteOpen => {
                 let record = next_string.next().expect("stage6 record per QuoteOpen");
                 assert_eq!(record.token_index as usize, t, "string/token mismatch");
-                let offset = stringbuf.append_record(&record.bytes);
-                debug_assert_eq!(offset, record.record_offset, "stage6 offset precomputation");
+                // Place the record at its prefix-sum offset; if the previous
+                // record shrank, the gap up to here is zero-filled.
+                let offset = stringbuf.append_record_at(record.record_offset, &record.bytes);
                 tape.push(make_string(offset));
             }
             TokenKind::ScalarStart => {
@@ -140,6 +156,10 @@ pub fn emit_tape(
             TokenKind::QuoteClose | TokenKind::Colon | TokenKind::Comma => {}
         }
     }
+
+    // Zero-fill the trailing gap if the last record shrank: the reference
+    // buffer is always exactly Σ (raw_len + 5) bytes.
+    stringbuf.pad_to(stringbuf_size);
 
     let last = tape.push(make_final_root());
     debug_assert_eq!(
@@ -193,12 +213,57 @@ mod tests {
             0x7200_0000_0000_0000, // [12] r -> 0
         ];
         assert_eq!(tape.as_words(), &expected);
-        let expected_strings: [u8; 19] = [
+        // 20 bytes = slots of raw_len+5: 6 ("a") + 6 ("b") + 8 ("x\n",
+        // raw len 3). The \n escape shrank the last record to 7 bytes, so
+        // its slot ends with one zero gap byte.
+        let expected_strings: [u8; 20] = [
             0x01, 0x00, 0x00, 0x00, 0x61, 0x00, // "a"
             0x01, 0x00, 0x00, 0x00, 0x62, 0x00, // "b"
             0x02, 0x00, 0x00, 0x00, 0x78, 0x0A, 0x00, // "x\n"
+            0x00, // gap
         ];
         assert_eq!(strings.as_bytes(), &expected_strings);
+    }
+
+    /// Gap policy, pinned byte for byte: interior and trailing gaps are
+    /// zero-filled, offsets come from the raw-length prefix sum.
+    #[test]
+    fn shrunk_records_leave_zero_filled_gaps() {
+        // ["\n","x","\t"] — raw lens 2, 1, 2 → slots 7, 6, 7 at offsets
+        // 0, 7, 13; every escape shrinks its record by one byte.
+        let (tape, strings) = emit(br#"["\n","x","\t"]"#);
+        assert_eq!(tape.as_words()[2], make_string(0));
+        assert_eq!(tape.as_words()[3], make_string(7));
+        assert_eq!(tape.as_words()[4], make_string(13));
+        let expected: [u8; 20] = [
+            0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, // "\n" record (6 bytes)
+            0x00, // interior gap
+            0x01, 0x00, 0x00, 0x00, 0x78, 0x00, // "x" record (6 bytes)
+            0x01, 0x00, 0x00, 0x00, 0x09, 0x00, // "\t" record (6 bytes)
+            0x00, // trailing gap
+        ];
+        assert_eq!(strings.as_bytes(), &expected);
+        // The records themselves decode exactly through the gaps.
+        assert_eq!(strings.record_bytes(0), b"\n");
+        assert_eq!(strings.record_bytes(7), b"x");
+        assert_eq!(strings.record_bytes(13), b"\t");
+    }
+
+    /// A surrogate-pair escape shrinks 12 raw bytes to 4 content bytes:
+    /// the next offset is unmoved and the 8 slack bytes are zeroed.
+    #[test]
+    fn surrogate_pair_gap_is_eight_zero_bytes() {
+        let bs = '\\';
+        let json = format!(r#"["{bs}uD83D{bs}uDE00","x"]"#);
+        let (tape, strings) = emit(json.as_bytes());
+        // Slot 0: raw len 12 → 17 bytes; slot 1 at 17.
+        assert_eq!(tape.as_words()[2], make_string(0));
+        assert_eq!(tape.as_words()[3], make_string(17));
+        assert_eq!(strings.len(), 17 + 6);
+        assert_eq!(strings.record_str(0), "\u{1F600}");
+        // Record 0 occupies 4+4+1 = 9 bytes; bytes 9..17 are the gap.
+        assert_eq!(&strings.as_bytes()[9..17], &[0u8; 8]);
+        assert_eq!(strings.record_str(17), "x");
     }
 
     #[test]
@@ -296,7 +361,7 @@ mod tests {
         let (tape, strings) = emit(br#"["",""]"#);
         let words = tape.as_words();
         assert_eq!(words[2], make_string(0));
-        assert_eq!(words[3], make_string(5)); // 4 (len) + 0 (content) + 1 (NUL)
+        assert_eq!(words[3], make_string(5)); // slot = raw_len 0 + 5
         assert_eq!(strings.record_bytes(0), b"");
         assert_eq!(strings.record_bytes(5), b"");
     }

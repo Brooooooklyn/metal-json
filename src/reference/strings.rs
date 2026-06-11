@@ -21,12 +21,18 @@
 //!
 //! Each output record also carries the byte offset its
 //! `[u32 LE length][content][NUL]` record will start at in the string
-//! buffer, assuming records are packed back to back in document order —
-//! exactly what [`emit_tape`](super::emit_tape) produces and what
-//! `StringBuffer::append_record` returns. (Deviation note: the GPU sizes
-//! records by a prefix sum over *raw* lengths, an upper bound, and may
-//! therefore leave gaps; only the offsets stored on the tape are
-//! meaningful. The reference packs exactly.)
+//! buffer. Offsets follow the tape-format-v1 allocation scheme (see
+//! `docs/tape-format.md`): the **exclusive prefix sum of `raw_len + 5`**
+//! over strings in document order, where `raw_len` is the byte count
+//! between the quotes in the *input* (before unescaping) and `+5` covers
+//! the 4-byte length prefix plus the NUL terminator. The GPU computes
+//! these offsets in the K7 scan from token positions alone — *before*
+//! unescaping runs — which is exactly why the scheme uses raw lengths.
+//! Unescaped content is always ≤ raw content, so a record whose escapes
+//! shrank it leaves a **gap** before the next slot; the reference
+//! zero-fills gaps (in [`emit_tape`](super::emit_tape)) so its output is
+//! deterministic, while GPU gap bytes are unspecified (kernel diff tests
+//! compare per-record bytes + tape offsets, never gap bytes).
 
 use super::tokens::{Token, TokenKind};
 use crate::error::{Error, Result, SyntaxErrorKind};
@@ -39,8 +45,14 @@ pub struct UnescapedString {
     pub token_index: u32,
     /// Fully unescaped UTF-8 content (may contain interior NULs).
     pub bytes: Vec<u8>,
-    /// Byte offset of this record in the (exactly packed) string buffer.
+    /// Byte offset of this record in the string buffer: the exclusive
+    /// prefix sum of `raw_len + 5` over the preceding strings (document
+    /// order). This is what the `"` tape word stores.
     pub record_offset: u64,
+    /// Byte count between the quotes in the input, before unescaping.
+    /// The record's allocated slot is `raw_len + 5` bytes; `bytes.len()`
+    /// never exceeds `raw_len`, and the difference is gap space.
+    pub raw_len: u32,
 }
 
 /// Stage 6: validate + unescape every string literal, in token order.
@@ -67,13 +79,17 @@ pub fn stage6_strings(tokens: &[Token], input: &[u8]) -> Result<Vec<UnescapedStr
             })?;
         let raw = &input[tok.pos as usize + 1..close.pos as usize];
         let bytes = unescape(raw, tok.pos + 1)?;
+        debug_assert!(bytes.len() <= raw.len(), "unescaping never grows a string");
         let record_offset = next_offset;
+        // Slot size uses the RAW length (offsets must be derivable from
+        // token positions alone, before unescaping), not bytes.len().
         next_offset +=
-            (STRING_RECORD_HEADER_BYTES + bytes.len() + STRING_RECORD_TRAILER_BYTES) as u64;
+            (STRING_RECORD_HEADER_BYTES + raw.len() + STRING_RECORD_TRAILER_BYTES) as u64;
         out.push(UnescapedString {
             token_index: u32::try_from(i).expect("more than u32::MAX tokens"),
             bytes,
             record_offset,
+            raw_len: u32::try_from(raw.len()).expect("string longer than u32::MAX bytes"),
         });
     }
     Ok(out)
@@ -325,26 +341,31 @@ mod tests {
     }
 
     #[test]
-    fn record_offsets_pack_back_to_back() {
-        // ["a","bc",""] — records: 4+1+1=6, 4+2+1=7, 4+0+1=5.
+    fn record_offsets_are_the_raw_length_prefix_sum() {
+        // ["a","bc",""] — slots of raw_len+5: 1+5=6, 2+5=7, 0+5=5; the
+        // offsets are the exclusive prefix sum: 0, 6, 13.
         let records = run(br#"["a","bc",""]"#).unwrap();
         let offsets: Vec<u64> = records.iter().map(|r| r.record_offset).collect();
         assert_eq!(offsets, vec![0, 6, 13]);
+        let raw_lens: Vec<u32> = records.iter().map(|r| r.raw_len).collect();
+        assert_eq!(raw_lens, vec![1, 2, 0]);
         let token_indices: Vec<u32> = records.iter().map(|r| r.token_index).collect();
         assert_eq!(token_indices, vec![1, 4, 7]);
     }
 
     #[test]
-    fn unescaped_length_can_shrink_the_record() {
-        // A surrogate-pair escape: 12 raw bytes -> 4 content bytes; the
-        // next record starts right after the *unescaped* record (exact
-        // packing).
+    fn shrinking_escapes_do_not_move_the_next_offset() {
+        // A surrogate-pair escape: 12 raw bytes -> 4 content bytes. The
+        // next slot still starts at the RAW-length prefix sum (4+12+1=17),
+        // leaving an 8-byte gap after the shrunk record — offsets depend
+        // only on token positions, never on unescape results.
         let mut input = b"[".to_vec();
         input.extend_from_slice(&quoted(&[&u_esc("D83D"), &u_esc("DE00")]));
         input.extend_from_slice(b",\"x\"]");
         let records = run(&input).unwrap();
         assert_eq!(records[0].bytes, "\u{1F600}".as_bytes());
-        assert_eq!(records[1].record_offset, (4 + 4 + 1) as u64);
+        assert_eq!(records[0].raw_len, 12);
+        assert_eq!(records[1].record_offset, (4 + 12 + 1) as u64);
     }
 
     #[test]
