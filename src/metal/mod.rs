@@ -95,9 +95,12 @@ impl MetalContext {
         params: Option<&MjParams>,
         work: Dispatch,
     ) -> Result<()> {
-        let cmd_buf = self.queue().commandBuffer().ok_or_else(|| Error::CommandBuffer {
-            message: "failed to create command buffer".to_owned(),
-        })?;
+        let cmd_buf = self
+            .queue()
+            .commandBuffer()
+            .ok_or_else(|| Error::CommandBuffer {
+                message: "failed to create command buffer".to_owned(),
+            })?;
         let encoder = cmd_buf
             .computeCommandEncoder()
             .ok_or_else(|| Error::CommandBuffer {

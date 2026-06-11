@@ -1,0 +1,7 @@
+{
+  "k": 1,
+  "k": 2,
+  "k": 3,
+  "other": {"d": true, "d": false},
+  "arr": [{"x": "first", "x": "second"}]
+}

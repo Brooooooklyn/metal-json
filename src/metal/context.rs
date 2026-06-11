@@ -3,9 +3,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-};
+use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary};
 
 use crate::error::{Error, Result};
 
@@ -67,8 +65,7 @@ impl std::fmt::Debug for MetalContext {
 fn load_library(
     device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>> {
-    static METALLIB: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/metal_json.metallib"));
+    static METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/metal_json.metallib"));
     // DispatchData::from_bytes copies; fine for a ~KB..MB library blob.
     let data = dispatch2::DispatchData::from_bytes(METALLIB);
     device
@@ -108,7 +105,10 @@ mod runtime {
     const EMBEDDED: &[(&str, &str)] = &[
         ("common.h", include_str!("../../shaders/common.h")),
         ("tape_types.h", include_str!("../../shaders/tape_types.h")),
-        ("00_smoke.metal", include_str!("../../shaders/00_smoke.metal")),
+        (
+            "00_smoke.metal",
+            include_str!("../../shaders/00_smoke.metal"),
+        ),
     ];
 
     fn shader_dir_override() -> Option<PathBuf> {
@@ -117,12 +117,8 @@ mod runtime {
 
     fn read_source(name: &str) -> Result<String> {
         if let Some(dir) = shader_dir_override() {
-            return std::fs::read_to_string(dir.join(name)).map_err(|e| {
-                Error::ShaderCompile {
-                    message: format!(
-                        "METAL_JSON_SHADER_DIR: cannot read `{name}`: {e}"
-                    ),
-                }
+            return std::fs::read_to_string(dir.join(name)).map_err(|e| Error::ShaderCompile {
+                message: format!("METAL_JSON_SHADER_DIR: cannot read `{name}`: {e}"),
             });
         }
         EMBEDDED

@@ -1,0 +1,9 @@
+{
+  "meta": {"version": 1, "generated": false, "schema": null},
+  "values": [0, -0.0, 1e10, "ten", true, null, {"inner": []}],
+  "matrix": [[1, 2], [3, 4], [5.5, -6.25]],
+  "lookup": {"a": {"b": {"c": [{"d": 1}, {"d": 2}]}}},
+  "strings": ["", " ", "  leading and trailing  ", "line\nbreak"],
+  "big": 123456789123456789,
+  "tiny": 1.5e-300
+}

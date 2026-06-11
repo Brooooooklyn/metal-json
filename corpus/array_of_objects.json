@@ -1,0 +1,7 @@
+[
+  {"id": 1, "name": "alpha", "tags": ["a", "b"], "active": true},
+  {"id": 2, "name": "beta", "tags": [], "active": false},
+  {"id": 3, "name": "gamma", "tags": ["c"], "active": null},
+  {"id": 4, "name": "δέλτα", "tags": ["unicode"], "score": 0.75},
+  {"id": 5, "name": "epsilon", "nested": {"deep": [{"er": true}]}}
+]

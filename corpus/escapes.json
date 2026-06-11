@@ -1,0 +1,9 @@
+[
+  "simple: \" \\ \/ \b \f \n \r \t",
+  "hex escapes: \u0041 \u00e9 \u00E9 \u4e2d \uFFFD",
+  "surrogate pairs: \uD83D\uDE00 \ud834\udd1e \uDBFF\uDFFF",
+  "interior nul: a\u0000b",
+  "escaped controls: \u0001\u001f\u007F",
+  {"key with \"quotes\" and \\backslash\\": "and \u0000 \u0009 nul"},
+  "mixed raw and escaped: é → \u00e9, 😀 → \uD83D\uDE00"
+]

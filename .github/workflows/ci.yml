@@ -16,8 +16,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build
         run: cargo build --workspace
+      - name: Fetch JSONTestSuite
+        run: bash scripts/fetch_jsontestsuite.sh
       - name: Test
-        run: cargo test --workspace
+        run: |
+          cargo test --workspace
+          cargo test -p metal-json --features cpu-reference
         env:
           MTL_SHADER_VALIDATION: "1"
           # CI runners must have a Metal device; never let GPU tests

@@ -2,6 +2,9 @@
 // AOT compile -> metallib -> library load -> pipeline -> dispatch -> readback.
 
 #include "common.h"
+// Compile coverage for the tape header until the first kernel uses it (M2+);
+// its constants/helpers must at least parse under both shader build paths.
+#include "tape_types.h"
 
 // out[i] = a[i] + b[i] over uint buffers.
 kernel void smoke_add(

@@ -89,12 +89,13 @@ impl GpuBuffer {
         // SAFETY: caller upholds the invariants documented above; passing no
         // deallocator means Metal never frees the memory.
         let raw = unsafe {
-            ctx.device().newBufferWithBytesNoCopy_length_options_deallocator(
-                ptr.cast::<c_void>(),
-                wrapped_len,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            )
+            ctx.device()
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    ptr.cast::<c_void>(),
+                    wrapped_len,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
         }
         .ok_or(Error::BufferAlloc { bytes: wrapped_len })?;
         Ok(Self { raw, len })
