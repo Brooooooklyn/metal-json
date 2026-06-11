@@ -28,7 +28,11 @@ jobs:
           # silently skip here.
           METAL_JSON_REQUIRE_GPU: "1"
       - name: Test (runtime-shaders fallback path)
-        run: cargo test -p metal-json --features runtime-shaders
+        run: |
+          cargo test -p metal-json --features runtime-shaders
+          # The M4 end-to-end gate (needs the cpu-reference oracle) on the
+          # runtime-compiled shader path too.
+          cargo test -p metal-json --features runtime-shaders,cpu-reference --test gpu_e2e
         env:
           MTL_SHADER_VALIDATION: "1"
           METAL_JSON_REQUIRE_GPU: "1"

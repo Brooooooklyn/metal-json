@@ -89,9 +89,11 @@
 //! reference defaults to).
 
 use crate::error::Result;
-use crate::metal::{Dispatch, GpuBuffer, MetalContext, MjParams, THREADGROUP_SIZE};
+use crate::metal::{
+    BoundBuffer, CommandBatch, Dispatch, GpuBuffer, MetalContext, MjParams, THREADGROUP_SIZE,
+};
 use crate::parser::DEFAULT_MAX_DEPTH;
-use crate::stage::{Stage, Stage1Buffers, Stage3Buffers, sort_passes};
+use crate::stage::{Stage, Stage1Buffers, Stage2Buffers, Stage3Buffers, sort_passes};
 use crate::tape::{make_final_root, make_root};
 
 use super::stage2::{Stage2, Stage2Accepted, Stage2Output, Stage2Run};
@@ -176,6 +178,18 @@ impl Stage3Output {
             ..Self::default()
         }
     }
+}
+
+/// The dispatch-shape scalars [`Stage3::encode_structure`] needs beyond the
+/// buffer containers (everything else — skeleton size, chunk count, sort
+/// pass count — is read off [`Stage3Buffers`]).
+pub(crate) struct StructureDims {
+    /// Unpadded input length in bytes.
+    pub(crate) input_len: u64,
+    /// Container nesting limit (kernels read it from `MjParams::reserved0`).
+    pub(crate) max_depth: u32,
+    /// Full tape length, `tape_word_total + 2` — K13's final-root index + 1.
+    pub(crate) tape_words: u64,
 }
 
 /// The CB3 kernels plus the composed [`Stage2`] (which composes
@@ -335,31 +349,10 @@ impl Stage3 {
             ));
         }
 
-        // The CB3 cooperative kernels are written for full 256-thread
-        // groups (same invariant the stage-1/2 orchestrations assert).
-        for stage in [
-            &self.depth_partials,
-            &self.depth_spine,
-            &self.depth_apply,
-            &self.sort_hist,
-            &self.sort_matrix_scan,
-            &self.sort_scatter,
-            &self.ctx_partials,
-            &self.ctx_spine,
-            &self.pair_ctx_apply,
-            &self.finalize,
-        ] {
-            let max = stage.pipeline(ctx)?.max_total_threads_per_threadgroup();
-            assert!(
-                max >= THREADGROUP_SIZE,
-                "kernel `{}` supports only {max} threads/threadgroup (< {THREADGROUP_SIZE})",
-                stage.name()
-            );
-        }
+        self.assert_threadgroup_support(ctx)?;
 
         let passes = sort_passes(max_depth);
         let mut bufs3 = Stage3Buffers::new(ctx, skeleton_total, passes)?;
-        let chunks = bufs3.chunks();
         let input_len = bufs1.input_len() as u64;
 
         // The tape buffer, zero-filled to establish the M3 hole convention
@@ -370,171 +363,22 @@ impl Stage3 {
         let mut tape_buf = GpuBuffer::alloc(ctx, tape_words * size_of::<u64>())?;
         tape_buf.contents_mut().fill(0);
 
-        let skel_params = MjParams {
-            input_len,
-            element_count: skeleton_total as u64,
-            reserved0: u64::from(max_depth),
-            reserved1: 0,
-        };
-        let chunk_params = MjParams {
-            input_len,
-            element_count: chunks as u64,
-            reserved0: u64::from(max_depth),
-            reserved1: 0,
-        };
-        let matrix_params = MjParams {
-            input_len,
-            element_count: (32 * chunks) as u64,
-            reserved0: u64::from(max_depth),
-            reserved1: 0,
-        };
-        let tape_params = MjParams {
-            input_len,
-            element_count: tape_words as u64, // K13: final root index + 1
-            reserved0: u64::from(max_depth),
-            reserved1: 0,
-        };
-
         // --- CB3: one commit, one wait --------------------------------------
         {
             let mut batch = ctx.batch()?;
-            let h_skel_ti =
-                batch.bind_read(bufs2.skel_token_index.as_ref().expect("lists allocated"));
-            let h_skel_pos = batch.bind_read(bufs2.skel_pos.as_ref().expect("lists allocated"));
-            let h_skel_byte = batch.bind_read(bufs2.skel_byte.as_ref().expect("lists allocated"));
-            let h_chunk_depth = batch.bind_write(&mut bufs3.chunk_depth);
-            let h_depths = batch.bind_write(&mut bufs3.depths);
-            let h_err = batch.bind_write(&mut bufs3.chunk_error);
-            let h_hist = batch.bind_write(&mut bufs3.sort_hist);
-            let h_sorted = batch.bind_write(&mut bufs3.sorted);
-            let h_scratch = bufs3.sorted_scratch.as_mut().map(|b| batch.bind_write(b));
-            let h_ctx = batch.bind_write(&mut bufs3.chunk_ctx);
-            let h_match = batch.bind_write(&mut bufs3.match_index);
-            let h_opener = batch.bind_write(&mut bufs3.context_opener);
-            let h_child = batch.bind_write(&mut bufs3.child_counts);
-            let h_tape_ofs = batch.bind_read(&bufs2.tape_ofs);
             let h_tape = batch.bind_write(&mut tape_buf);
             let h_header = batch.bind_write(&mut bufs1.header);
-
-            // Depth scan: reduce → spine → apply.
-            self.depth_partials.encode(
+            self.encode_structure(
                 &mut batch,
-                &[h_skel_byte, h_chunk_depth],
-                Some(&skel_params),
-                Dispatch::Threadgroups(chunks),
-            )?;
-            self.depth_spine.encode(
-                &mut batch,
-                &[h_chunk_depth],
-                Some(&chunk_params),
-                Dispatch::Threadgroups(1),
-            )?;
-            self.depth_apply.encode(
-                &mut batch,
-                &[h_skel_byte, h_skel_pos, h_chunk_depth, h_depths, h_err],
-                Some(&skel_params),
-                Dispatch::Threadgroups(chunks),
-            )?;
-
-            // K8: LSD radix passes; pass 0 reads the implicit identity
-            // ordering, later passes ping-pong so the LAST pass lands in
-            // `sorted`.
-            for pass in 0..passes {
-                let to_sorted = (passes - 1 - pass).is_multiple_of(2);
-                let h_out = if to_sorted {
-                    h_sorted
-                } else {
-                    h_scratch.expect("scratch exists for multi-pass sorts")
-                };
-                // Pass 0's input binding is ignored (identity flag); bind
-                // `sorted` as the placeholder.
-                let h_in = if pass == 0 {
-                    h_sorted
-                } else if to_sorted {
-                    h_scratch.expect("scratch exists for multi-pass sorts")
-                } else {
-                    h_sorted
-                };
-                let pass_params = MjParams {
+                &bufs2,
+                &mut bufs3,
+                h_tape,
+                h_header,
+                &StructureDims {
                     input_len,
-                    element_count: skeleton_total as u64,
-                    reserved0: u64::from(max_depth),
-                    reserved1: (5 * pass as u64) | if pass == 0 { 1 << 8 } else { 0 },
-                };
-                self.sort_hist.encode(
-                    &mut batch,
-                    &[h_depths, h_in, h_hist],
-                    Some(&pass_params),
-                    Dispatch::Threadgroups(chunks),
-                )?;
-                self.sort_matrix_scan.encode(
-                    &mut batch,
-                    &[h_hist],
-                    Some(&matrix_params),
-                    Dispatch::Threadgroups(1),
-                )?;
-                self.sort_scatter.encode(
-                    &mut batch,
-                    &[h_depths, h_in, h_hist, h_out],
-                    Some(&pass_params),
-                    Dispatch::Threadgroups(chunks),
-                )?;
-            }
-
-            // K9: reduce → spine → apply over the sorted order, then the
-            // error fold.
-            self.ctx_partials.encode(
-                &mut batch,
-                &[h_sorted, h_depths, h_skel_byte, h_skel_ti, h_ctx],
-                Some(&skel_params),
-                Dispatch::Threadgroups(chunks),
-            )?;
-            self.ctx_spine.encode(
-                &mut batch,
-                &[h_ctx],
-                Some(&chunk_params),
-                Dispatch::Threadgroups(1),
-            )?;
-            self.pair_ctx_apply.encode(
-                &mut batch,
-                &[
-                    h_sorted,
-                    h_depths,
-                    h_skel_byte,
-                    h_skel_pos,
-                    h_skel_ti,
-                    h_ctx,
-                    h_match,
-                    h_opener,
-                    h_child,
-                    h_err,
-                ],
-                Some(&skel_params),
-                Dispatch::Threadgroups(chunks),
-            )?;
-
-            // K12/K13: the tape's container + root words. Plain thread
-            // grids — neither kernel uses cooperative scans. The serial
-            // encoder orders K12 after pair_ctx_apply (it gathers through
-            // match_index / child_counts).
-            self.emit_container.encode(
-                &mut batch,
-                &[h_skel_ti, h_skel_byte, h_match, h_child, h_tape_ofs, h_tape],
-                Some(&skel_params),
-                Dispatch::Threads(skeleton_total),
-            )?;
-            self.tape_root.encode(
-                &mut batch,
-                &[h_tape],
-                Some(&tape_params),
-                Dispatch::Threads(1),
-            )?;
-
-            self.finalize.encode(
-                &mut batch,
-                &[h_err, h_header],
-                Some(&chunk_params),
-                Dispatch::Threadgroups(1),
+                    max_depth,
+                    tape_words: tape_words as u64,
+                },
             )?;
             gpu_seconds += batch.commit_and_wait_timed()?;
         }
@@ -562,6 +406,237 @@ impl Stage3 {
             gpu_seconds,
         ))
     }
+
+    /// The composed stage-2 runner (for the full pipeline orchestration in
+    /// [`crate::gpu::pipeline`], which drives the first two syncs itself).
+    pub(crate) fn stage2(&self) -> &Stage2 {
+        &self.stage2
+    }
+
+    /// The `structure_finalize` error-fold stage. The M4 string kernel
+    /// reuses it verbatim (its contract — min-fold a `ulong` chunk-error
+    /// array into `header.error` from one threadgroup — is exactly what
+    /// K11's per-chunk error words need), and sharing the [`Stage`] shares
+    /// the cached pipeline-state object.
+    pub(crate) fn finalize_stage(&self) -> &Stage {
+        &self.finalize
+    }
+
+    /// Assert that every cooperative CB3 kernel supports full 256-thread
+    /// groups (the same invariant the stage-1/2 orchestrations assert).
+    pub(crate) fn assert_threadgroup_support(&self, ctx: &MetalContext) -> Result<()> {
+        for stage in [
+            &self.depth_partials,
+            &self.depth_spine,
+            &self.depth_apply,
+            &self.sort_hist,
+            &self.sort_matrix_scan,
+            &self.sort_scatter,
+            &self.ctx_partials,
+            &self.ctx_spine,
+            &self.pair_ctx_apply,
+            &self.finalize,
+        ] {
+            let max = stage.pipeline(ctx)?.max_total_threads_per_threadgroup();
+            assert!(
+                max >= THREADGROUP_SIZE,
+                "kernel `{}` supports only {max} threads/threadgroup (< {THREADGROUP_SIZE})",
+                stage.name()
+            );
+        }
+        Ok(())
+    }
+
+    /// Encode the CB3 **structure** dispatches (depth scan → K8 sort → K9
+    /// pair/context → K12 container words → K13 root words → error fold)
+    /// into `batch`. Shared between [`Stage3::run`] (the M3 test runner,
+    /// which commits this as its whole CB3) and the full M4 pipeline
+    /// ([`crate::gpu::pipeline`], which appends the K10/K11 scalar
+    /// dispatches to the same command buffer — they consume only stage-2
+    /// outputs, so the serial encoder's ordering constraints stay local to
+    /// this block).
+    ///
+    /// `h_tape` / `h_header` are bound by the caller (the tape is shared
+    /// with K10/K11 and the header with K11's error fold); the skeleton
+    /// lists and `tape_ofs` are bound here from `bufs2`, the CB3 scratch
+    /// from `bufs3` (which also carries the skeleton size, the chunk count
+    /// and the sort pass count these dispatches are shaped by).
+    pub(crate) fn encode_structure<'env>(
+        &self,
+        batch: &mut CommandBatch<'env>,
+        bufs2: &'env Stage2Buffers,
+        bufs3: &'env mut Stage3Buffers,
+        h_tape: BoundBuffer,
+        h_header: BoundBuffer,
+        dims: &StructureDims,
+    ) -> Result<()> {
+        let skeleton_total = bufs3.skeleton_total();
+        let chunks = bufs3.chunks();
+        let passes = bufs3.passes();
+        let input_len = dims.input_len;
+        let max_depth = dims.max_depth;
+
+        let skel_params = MjParams {
+            input_len,
+            element_count: skeleton_total as u64,
+            reserved0: u64::from(max_depth),
+            reserved1: 0,
+        };
+        let chunk_params = MjParams {
+            input_len,
+            element_count: chunks as u64,
+            reserved0: u64::from(max_depth),
+            reserved1: 0,
+        };
+        let matrix_params = MjParams {
+            input_len,
+            element_count: (32 * chunks) as u64,
+            reserved0: u64::from(max_depth),
+            reserved1: 0,
+        };
+        let tape_params = MjParams {
+            input_len,
+            element_count: dims.tape_words, // K13: final root index + 1
+            reserved0: u64::from(max_depth),
+            reserved1: 0,
+        };
+
+        let h_skel_ti = batch.bind_read(bufs2.skel_token_index.as_ref().expect("lists allocated"));
+        let h_skel_pos = batch.bind_read(bufs2.skel_pos.as_ref().expect("lists allocated"));
+        let h_skel_byte = batch.bind_read(bufs2.skel_byte.as_ref().expect("lists allocated"));
+        let h_chunk_depth = batch.bind_write(&mut bufs3.chunk_depth);
+        let h_depths = batch.bind_write(&mut bufs3.depths);
+        let h_err = batch.bind_write(&mut bufs3.chunk_error);
+        let h_hist = batch.bind_write(&mut bufs3.sort_hist);
+        let h_sorted = batch.bind_write(&mut bufs3.sorted);
+        let h_scratch = bufs3.sorted_scratch.as_mut().map(|b| batch.bind_write(b));
+        let h_ctx = batch.bind_write(&mut bufs3.chunk_ctx);
+        let h_match = batch.bind_write(&mut bufs3.match_index);
+        let h_opener = batch.bind_write(&mut bufs3.context_opener);
+        let h_child = batch.bind_write(&mut bufs3.child_counts);
+        let h_tape_ofs = batch.bind_read(&bufs2.tape_ofs);
+
+        // Depth scan: reduce → spine → apply.
+        self.depth_partials.encode(
+            batch,
+            &[h_skel_byte, h_chunk_depth],
+            Some(&skel_params),
+            Dispatch::Threadgroups(chunks),
+        )?;
+        self.depth_spine.encode(
+            batch,
+            &[h_chunk_depth],
+            Some(&chunk_params),
+            Dispatch::Threadgroups(1),
+        )?;
+        self.depth_apply.encode(
+            batch,
+            &[h_skel_byte, h_skel_pos, h_chunk_depth, h_depths, h_err],
+            Some(&skel_params),
+            Dispatch::Threadgroups(chunks),
+        )?;
+
+        // K8: LSD radix passes; pass 0 reads the implicit identity
+        // ordering, later passes ping-pong so the LAST pass lands in
+        // `sorted`.
+        for pass in 0..passes {
+            let to_sorted = (passes - 1 - pass).is_multiple_of(2);
+            let h_out = if to_sorted {
+                h_sorted
+            } else {
+                h_scratch.expect("scratch exists for multi-pass sorts")
+            };
+            // Pass 0's input binding is ignored (identity flag); bind
+            // `sorted` as the placeholder.
+            let h_in = if pass == 0 {
+                h_sorted
+            } else if to_sorted {
+                h_scratch.expect("scratch exists for multi-pass sorts")
+            } else {
+                h_sorted
+            };
+            let pass_params = MjParams {
+                input_len,
+                element_count: skeleton_total as u64,
+                reserved0: u64::from(max_depth),
+                reserved1: (5 * pass as u64) | if pass == 0 { 1 << 8 } else { 0 },
+            };
+            self.sort_hist.encode(
+                batch,
+                &[h_depths, h_in, h_hist],
+                Some(&pass_params),
+                Dispatch::Threadgroups(chunks),
+            )?;
+            self.sort_matrix_scan.encode(
+                batch,
+                &[h_hist],
+                Some(&matrix_params),
+                Dispatch::Threadgroups(1),
+            )?;
+            self.sort_scatter.encode(
+                batch,
+                &[h_depths, h_in, h_hist, h_out],
+                Some(&pass_params),
+                Dispatch::Threadgroups(chunks),
+            )?;
+        }
+
+        // K9: reduce → spine → apply over the sorted order, then the
+        // error fold.
+        self.ctx_partials.encode(
+            batch,
+            &[h_sorted, h_depths, h_skel_byte, h_skel_ti, h_ctx],
+            Some(&skel_params),
+            Dispatch::Threadgroups(chunks),
+        )?;
+        self.ctx_spine.encode(
+            batch,
+            &[h_ctx],
+            Some(&chunk_params),
+            Dispatch::Threadgroups(1),
+        )?;
+        self.pair_ctx_apply.encode(
+            batch,
+            &[
+                h_sorted,
+                h_depths,
+                h_skel_byte,
+                h_skel_pos,
+                h_skel_ti,
+                h_ctx,
+                h_match,
+                h_opener,
+                h_child,
+                h_err,
+            ],
+            Some(&skel_params),
+            Dispatch::Threadgroups(chunks),
+        )?;
+
+        // K12/K13: the tape's container + root words. Plain thread
+        // grids — neither kernel uses cooperative scans. The serial
+        // encoder orders K12 after pair_ctx_apply (it gathers through
+        // match_index / child_counts).
+        self.emit_container.encode(
+            batch,
+            &[h_skel_ti, h_skel_byte, h_match, h_child, h_tape_ofs, h_tape],
+            Some(&skel_params),
+            Dispatch::Threads(skeleton_total),
+        )?;
+        self.tape_root.encode(
+            batch,
+            &[h_tape],
+            Some(&tape_params),
+            Dispatch::Threads(1),
+        )?;
+
+        self.finalize.encode(
+            batch,
+            &[h_err, h_header],
+            Some(&chunk_params),
+            Dispatch::Threadgroups(1),
+        )
+    }
 }
 
 impl Default for Stage3 {
@@ -574,9 +649,11 @@ impl Default for Stage3 {
 /// (depth scan, K8 sort, K9 pair/context, K12 container words, K13 root
 /// words, error fold) over `input` at the default depth limit, with every
 /// allocation exact-sized from the header totals at each CPU sync and
-/// per-CB error short-circuits per the rejection contract. This is what
-/// the parser integration will call; [`Stage3::run`] is the same runner on
-/// a reusable [`Stage3`] (tests that run many inputs hold one).
+/// per-CB error short-circuits per the rejection contract. The parser's
+/// production path is [`crate::gpu::pipeline::GpuPipeline`], which appends
+/// the M4 scalar kernels to the same CB3 via [`Stage3::encode_structure`];
+/// [`Stage3::run`] is the same structure-only runner on a reusable
+/// [`Stage3`] (tests that run many inputs hold one).
 ///
 /// # Errors
 ///

@@ -30,11 +30,9 @@ impl Document {
     ///
     /// The pair must be a complete, valid tape-format-v1 encoding (root
     /// words present, containers patched); both backends guarantee that
-    /// before constructing a `Document`.
-    //
-    // Without `cpu-reference` the only non-test caller (the reference
-    // backend arm of `Parser::parse`) is compiled out.
-    #[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
+    /// before constructing a `Document` — and on the GPU backend the
+    /// rejection contract guarantees the buffers are never even copied out
+    /// on a failed parse.
     pub(crate) fn from_parts(tape: TapeBuffer, strings: StringBuffer) -> Self {
         debug_assert!(
             tape.len() >= 3,

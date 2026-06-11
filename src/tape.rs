@@ -329,6 +329,13 @@ impl TapeBuffer {
         }
     }
 
+    /// A tape over already-finished words (the GPU backend's copy-out path;
+    /// `words` must be a complete tape-format-v1 encoding). M5 TODO: a
+    /// zero-copy variant over the shared `GpuBuffer` replaces this copy.
+    pub(crate) fn from_words(words: Vec<u64>) -> Self {
+        Self { words }
+    }
+
     /// Append a word, returning its tape index.
     #[inline]
     pub fn push(&mut self, word: u64) -> usize {
@@ -417,6 +424,14 @@ impl StringBuffer {
         Self {
             bytes: Vec::with_capacity(capacity),
         }
+    }
+
+    /// A string buffer over already-finished record bytes (the GPU
+    /// backend's copy-out path; `bytes` must hold `[u32 LE len][content]
+    /// [NUL]` records at the offsets the tape's `"` words carry). M5 TODO:
+    /// a zero-copy variant over the shared `GpuBuffer` replaces this copy.
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
     }
 
     /// Append a `[u32 LE length][content][NUL]` record and return the byte

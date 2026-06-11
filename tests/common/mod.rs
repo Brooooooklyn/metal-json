@@ -4,6 +4,8 @@
 //! the GPU backend will be diffed against in M2-M4.
 #![allow(dead_code)] // each test crate uses a different subset
 
+pub mod numbers;
+
 use std::path::{Path, PathBuf};
 
 use metal_json::{Backend, Parser, ParserOptions, Value, ValueKind};
@@ -13,6 +15,55 @@ pub fn cpu_parser() -> Parser {
     let mut opts = ParserOptions::default();
     opts.backend = Backend::CpuReference;
     Parser::with_options(opts).expect("CPU reference parser construction cannot fail")
+}
+
+/// A parser on the default GPU backend, or `None` (with a loud skip
+/// message) when no usable Metal device exists — unless
+/// `METAL_JSON_REQUIRE_GPU=1` (set in CI) makes that a hard failure.
+pub fn gpu_parser_or_skip(test: &str) -> Option<Parser> {
+    match Parser::new() {
+        Ok(parser) => Some(parser),
+        Err(err) => {
+            if std::env::var_os("METAL_JSON_REQUIRE_GPU").is_some_and(|v| v == "1") {
+                panic!("METAL_JSON_REQUIRE_GPU=1 but no usable Metal device: {err}");
+            }
+            eprintln!("SKIP {test}: no usable Metal device here ({err})");
+            None
+        }
+    }
+}
+
+/// Recursively assert two parsed documents agree: kinds, scalar values
+/// (doubles bit-for-bit), string contents, array elements in order, object
+/// members in order (keys included — duplicates and all). The GPU-vs-
+/// reference counterpart of [`assert_doc_eq`].
+pub fn assert_docs_eq(got: Value<'_>, want: Value<'_>, path: &str) {
+    assert_eq!(got.kind(), want.kind(), "{path}: kind");
+    match want.kind() {
+        ValueKind::Null => assert!(got.is_null(), "{path}: null"),
+        ValueKind::Bool => assert_eq!(got.as_bool(), want.as_bool(), "{path}: bool"),
+        ValueKind::Int64 => assert_eq!(got.as_i64(), want.as_i64(), "{path}: i64"),
+        ValueKind::UInt64 => assert_eq!(got.as_u64(), want.as_u64(), "{path}: u64"),
+        ValueKind::Double => assert_eq!(
+            got.as_f64().map(f64::to_bits),
+            want.as_f64().map(f64::to_bits),
+            "{path}: f64 bits"
+        ),
+        ValueKind::String => assert_eq!(got.as_str(), want.as_str(), "{path}: string"),
+        ValueKind::Array => {
+            assert_eq!(got.len(), want.len(), "{path}: array length");
+            for (i, (g, w)) in got.elements().zip(want.elements()).enumerate() {
+                assert_docs_eq(g, w, &format!("{path}[{i}]"));
+            }
+        }
+        ValueKind::Object => {
+            assert_eq!(got.len(), want.len(), "{path}: member count");
+            for (i, ((gk, gv), (wk, wv))) in got.entries().zip(want.entries()).enumerate() {
+                assert_eq!(gk, wk, "{path}: key #{i}");
+                assert_docs_eq(gv, wv, &format!("{path}.{}", wk.escape_debug()));
+            }
+        }
+    }
 }
 
 /// The checked-in corpus directory (always present in the repo).
@@ -87,6 +138,204 @@ pub fn has_duplicate_keys(value: Value<'_>) -> bool {
         _ => false,
     }
 }
+
+/// Pinned verdict (`true` = accept) and rationale for every `i_*`
+/// JSONTestSuite file. These are implementation-defined by JSONTestSuite;
+/// ours mirror simdjson — and they are SHARED between the CPU conformance
+/// suite (`tests/jsontestsuite.rs`) and the GPU milestone gate
+/// (`tests/gpu_e2e.rs`), so the two backends cannot drift apart:
+///
+/// - **number precision/overflow**: grammar-valid numbers whose value
+///   overflows to ±inf are REJECTED (simdjson rejects infinities);
+///   underflow to 0.0 and precision loss on huge mantissas are ACCEPTED
+///   (value = `str::parse::<f64>()`, correctly rounded);
+/// - **integers beyond u64**: fall to the double path and are ACCEPTED
+///   with the correctly rounded f64 value;
+/// - **invalid UTF-8 / UTF-16 input**: REJECTED — the contract validates
+///   full UTF-8 (Error::Utf8);
+/// - **lone/inverted `\uXXXX` surrogate escapes**: REJECTED
+///   (InvalidStringEscape), like simdjson;
+/// - **depth 500**: ACCEPTED (limit is 1024, simdjson parity);
+/// - **UTF-8 BOM**: REJECTED (0xEF cannot start a scalar), like simdjson
+///   without its BOM-stripping front end.
+pub const I_FILE_VERDICTS: &[(&str, bool, &str)] = &[
+    (
+        "i_number_double_huge_neg_exp.json",
+        true,
+        "123.456e-789 underflows to 0.0; underflow is accepted",
+    ),
+    (
+        "i_number_huge_exp.json",
+        false,
+        "0.4e+00669...9 overflows to inf; overflow is rejected (InvalidNumber)",
+    ),
+    (
+        "i_number_neg_int_huge_exp.json",
+        false,
+        "-1e+9999 overflows to -inf; rejected",
+    ),
+    (
+        "i_number_pos_double_huge_exp.json",
+        false,
+        "1.5e+9999 overflows to inf; rejected",
+    ),
+    (
+        "i_number_real_neg_overflow.json",
+        false,
+        "-123123e100000 overflows to -inf; rejected",
+    ),
+    (
+        "i_number_real_pos_overflow.json",
+        false,
+        "123123e100000 overflows to inf; rejected",
+    ),
+    (
+        "i_number_real_underflow.json",
+        true,
+        "123e-10000000 underflows to 0.0; accepted",
+    ),
+    (
+        "i_number_too_big_neg_int.json",
+        true,
+        "30-digit negative integer: beyond i64, parses as correctly rounded f64",
+    ),
+    (
+        "i_number_too_big_pos_int.json",
+        true,
+        "21-digit integer: beyond u64, parses as correctly rounded f64",
+    ),
+    (
+        "i_number_very_big_negative_int.json",
+        true,
+        "27-digit negative integer: parses as correctly rounded f64",
+    ),
+    (
+        "i_object_key_lone_2nd_surrogate.json",
+        false,
+        "lone low-surrogate escape in a key: InvalidStringEscape",
+    ),
+    (
+        "i_string_1st_surrogate_but_2nd_missing.json",
+        false,
+        "high-surrogate escape with no low surrogate: InvalidStringEscape",
+    ),
+    (
+        "i_string_1st_valid_surrogate_2nd_invalid.json",
+        false,
+        "high surrogate chased by a non-surrogate escape: InvalidStringEscape",
+    ),
+    (
+        "i_string_incomplete_surrogate_and_escape_valid.json",
+        false,
+        "high surrogate chased by \\n: InvalidStringEscape",
+    ),
+    (
+        "i_string_incomplete_surrogate_pair.json",
+        false,
+        "lone low-surrogate escape: InvalidStringEscape",
+    ),
+    (
+        "i_string_incomplete_surrogates_escape_valid.json",
+        false,
+        "two high surrogates in a row: InvalidStringEscape",
+    ),
+    (
+        "i_string_invalid_lonely_surrogate.json",
+        false,
+        "lone high-surrogate escape: InvalidStringEscape",
+    ),
+    (
+        "i_string_invalid_surrogate.json",
+        false,
+        "high surrogate followed by plain characters: InvalidStringEscape",
+    ),
+    (
+        "i_string_invalid_utf-8.json",
+        false,
+        "raw 0xFF byte: Error::Utf8",
+    ),
+    (
+        "i_string_inverted_surrogates_U+1D11E.json",
+        false,
+        "low surrogate before high surrogate: InvalidStringEscape",
+    ),
+    (
+        "i_string_iso_latin_1.json",
+        false,
+        "Latin-1 (non-UTF-8) byte: Error::Utf8",
+    ),
+    (
+        "i_string_lone_second_surrogate.json",
+        false,
+        "lone low-surrogate escape: InvalidStringEscape",
+    ),
+    (
+        "i_string_lone_utf8_continuation_byte.json",
+        false,
+        "stray continuation byte: Error::Utf8",
+    ),
+    (
+        "i_string_not_in_unicode_range.json",
+        false,
+        "encodes a code point above U+10FFFF: Error::Utf8",
+    ),
+    (
+        "i_string_overlong_sequence_2_bytes.json",
+        false,
+        "overlong 2-byte encoding: Error::Utf8",
+    ),
+    (
+        "i_string_overlong_sequence_6_bytes.json",
+        false,
+        "6-byte (pre-2003) UTF-8 sequence: Error::Utf8",
+    ),
+    (
+        "i_string_overlong_sequence_6_bytes_null.json",
+        false,
+        "overlong 6-byte encoding of NUL: Error::Utf8",
+    ),
+    (
+        "i_string_truncated-utf-8.json",
+        false,
+        "truncated multibyte sequence: Error::Utf8",
+    ),
+    (
+        "i_string_UTF-16LE_with_BOM.json",
+        false,
+        "UTF-16 input: not valid UTF-8, Error::Utf8",
+    ),
+    (
+        "i_string_UTF-8_invalid_sequence.json",
+        false,
+        "invalid UTF-8 sequence: Error::Utf8",
+    ),
+    (
+        "i_string_utf16BE_no_BOM.json",
+        false,
+        "UTF-16BE input: not valid UTF-8, Error::Utf8",
+    ),
+    (
+        "i_string_utf16LE_no_BOM.json",
+        false,
+        "UTF-16LE input: not valid UTF-8, Error::Utf8",
+    ),
+    (
+        "i_string_UTF8_surrogate_U+D800.json",
+        false,
+        "raw UTF-8-encoded surrogate: Error::Utf8",
+    ),
+    (
+        "i_structure_500_nested_arrays.json",
+        true,
+        "500 < the 1024 depth limit (simdjson parity); parses fine",
+    ),
+    (
+        "i_structure_UTF-8_BOM_empty_object.json",
+        false,
+        "UTF-8 BOM before {}: 0xEF cannot start a scalar (UnexpectedToken), \
+         matching simdjson's no-BOM stance",
+    ),
+];
 
 /// Recursively assert that our tape walk of `ours` matches serde_json's
 /// parse of the same document.

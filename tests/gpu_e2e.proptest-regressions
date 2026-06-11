@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9c17a7034bf531212f71e4628e1814d5639ed0d2f41f4d928bbc2c9372c51545 # shrinks to value = Object {"": Number(2449958197289549825)} — an i64 value word whose high byte collides with the '"' tape tag (caught a tape-walker bug in this suite's record comparator)

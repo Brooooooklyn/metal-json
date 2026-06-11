@@ -6,7 +6,8 @@
 //! - `n_*.json` MUST return `Err` — and the library must never panic;
 //! - `i_*.json` (implementation-defined) may go either way but must not
 //!   crash; our choice for every `i_*` file is pinned in
-//!   [`I_FILE_VERDICTS`] with a reason, so any behavior change is noticed.
+//!   [`common::I_FILE_VERDICTS`] with a reason (shared with the GPU gate in
+//!   `tests/gpu_e2e.rs`), so any behavior change is noticed.
 //!
 //! The corpus lives in the gitignored `data/JSONTestSuite` (fetch with
 //! `scripts/fetch_jsontestsuite.sh`); the run auto-skips loudly when it is
@@ -45,201 +46,6 @@ const N_FILE_NOTES: &[(&str, &str)] = &[
         "n_multidigit_number_then_00.json",
         "`123\\0`: the NUL byte extends the scalar run, so this is rejected \
          by the number grammar (InvalidNumber), not as a stray token.",
-    ),
-];
-
-/// Pinned verdict (`true` = accept) and rationale for every `i_*` file.
-/// These are implementation-defined by JSONTestSuite; ours mirror simdjson:
-///
-/// - **number precision/overflow**: grammar-valid numbers whose value
-///   overflows to ±inf are REJECTED (simdjson rejects infinities);
-///   underflow to 0.0 and precision loss on huge mantissas are ACCEPTED
-///   (value = `str::parse::<f64>()`, correctly rounded);
-/// - **integers beyond u64**: fall to the double path and are ACCEPTED
-///   with the correctly rounded f64 value;
-/// - **invalid UTF-8 / UTF-16 input**: REJECTED — the contract validates
-///   full UTF-8 (Error::Utf8);
-/// - **lone/inverted `\uXXXX` surrogate escapes**: REJECTED
-///   (InvalidStringEscape), like simdjson;
-/// - **depth 500**: ACCEPTED (limit is 1024, simdjson parity);
-/// - **UTF-8 BOM**: REJECTED (0xEF cannot start a scalar), like simdjson
-///   without its BOM-stripping front end.
-const I_FILE_VERDICTS: &[(&str, bool, &str)] = &[
-    (
-        "i_number_double_huge_neg_exp.json",
-        true,
-        "123.456e-789 underflows to 0.0; underflow is accepted",
-    ),
-    (
-        "i_number_huge_exp.json",
-        false,
-        "0.4e+00669...9 overflows to inf; overflow is rejected (InvalidNumber)",
-    ),
-    (
-        "i_number_neg_int_huge_exp.json",
-        false,
-        "-1e+9999 overflows to -inf; rejected",
-    ),
-    (
-        "i_number_pos_double_huge_exp.json",
-        false,
-        "1.5e+9999 overflows to inf; rejected",
-    ),
-    (
-        "i_number_real_neg_overflow.json",
-        false,
-        "-123123e100000 overflows to -inf; rejected",
-    ),
-    (
-        "i_number_real_pos_overflow.json",
-        false,
-        "123123e100000 overflows to inf; rejected",
-    ),
-    (
-        "i_number_real_underflow.json",
-        true,
-        "123e-10000000 underflows to 0.0; accepted",
-    ),
-    (
-        "i_number_too_big_neg_int.json",
-        true,
-        "30-digit negative integer: beyond i64, parses as correctly rounded f64",
-    ),
-    (
-        "i_number_too_big_pos_int.json",
-        true,
-        "21-digit integer: beyond u64, parses as correctly rounded f64",
-    ),
-    (
-        "i_number_very_big_negative_int.json",
-        true,
-        "27-digit negative integer: parses as correctly rounded f64",
-    ),
-    (
-        "i_object_key_lone_2nd_surrogate.json",
-        false,
-        "lone low-surrogate escape in a key: InvalidStringEscape",
-    ),
-    (
-        "i_string_1st_surrogate_but_2nd_missing.json",
-        false,
-        "high-surrogate escape with no low surrogate: InvalidStringEscape",
-    ),
-    (
-        "i_string_1st_valid_surrogate_2nd_invalid.json",
-        false,
-        "high surrogate chased by a non-surrogate escape: InvalidStringEscape",
-    ),
-    (
-        "i_string_incomplete_surrogate_and_escape_valid.json",
-        false,
-        "high surrogate chased by \\n: InvalidStringEscape",
-    ),
-    (
-        "i_string_incomplete_surrogate_pair.json",
-        false,
-        "lone low-surrogate escape: InvalidStringEscape",
-    ),
-    (
-        "i_string_incomplete_surrogates_escape_valid.json",
-        false,
-        "two high surrogates in a row: InvalidStringEscape",
-    ),
-    (
-        "i_string_invalid_lonely_surrogate.json",
-        false,
-        "lone high-surrogate escape: InvalidStringEscape",
-    ),
-    (
-        "i_string_invalid_surrogate.json",
-        false,
-        "high surrogate followed by plain characters: InvalidStringEscape",
-    ),
-    (
-        "i_string_invalid_utf-8.json",
-        false,
-        "raw 0xFF byte: Error::Utf8",
-    ),
-    (
-        "i_string_inverted_surrogates_U+1D11E.json",
-        false,
-        "low surrogate before high surrogate: InvalidStringEscape",
-    ),
-    (
-        "i_string_iso_latin_1.json",
-        false,
-        "Latin-1 (non-UTF-8) byte: Error::Utf8",
-    ),
-    (
-        "i_string_lone_second_surrogate.json",
-        false,
-        "lone low-surrogate escape: InvalidStringEscape",
-    ),
-    (
-        "i_string_lone_utf8_continuation_byte.json",
-        false,
-        "stray continuation byte: Error::Utf8",
-    ),
-    (
-        "i_string_not_in_unicode_range.json",
-        false,
-        "encodes a code point above U+10FFFF: Error::Utf8",
-    ),
-    (
-        "i_string_overlong_sequence_2_bytes.json",
-        false,
-        "overlong 2-byte encoding: Error::Utf8",
-    ),
-    (
-        "i_string_overlong_sequence_6_bytes.json",
-        false,
-        "6-byte (pre-2003) UTF-8 sequence: Error::Utf8",
-    ),
-    (
-        "i_string_overlong_sequence_6_bytes_null.json",
-        false,
-        "overlong 6-byte encoding of NUL: Error::Utf8",
-    ),
-    (
-        "i_string_truncated-utf-8.json",
-        false,
-        "truncated multibyte sequence: Error::Utf8",
-    ),
-    (
-        "i_string_UTF-16LE_with_BOM.json",
-        false,
-        "UTF-16 input: not valid UTF-8, Error::Utf8",
-    ),
-    (
-        "i_string_UTF-8_invalid_sequence.json",
-        false,
-        "invalid UTF-8 sequence: Error::Utf8",
-    ),
-    (
-        "i_string_utf16BE_no_BOM.json",
-        false,
-        "UTF-16BE input: not valid UTF-8, Error::Utf8",
-    ),
-    (
-        "i_string_utf16LE_no_BOM.json",
-        false,
-        "UTF-16LE input: not valid UTF-8, Error::Utf8",
-    ),
-    (
-        "i_string_UTF8_surrogate_U+D800.json",
-        false,
-        "raw UTF-8-encoded surrogate: Error::Utf8",
-    ),
-    (
-        "i_structure_500_nested_arrays.json",
-        true,
-        "500 < the 1024 depth limit (simdjson parity); parses fine",
-    ),
-    (
-        "i_structure_UTF-8_BOM_empty_object.json",
-        false,
-        "UTF-8 BOM before {}: 0xEF cannot start a scalar (UnexpectedToken), \
-         matching simdjson's no-BOM stance",
     ),
 ];
 
@@ -284,9 +90,9 @@ fn jsontestsuite_verdicts() {
                         } else {
                             i_reject += 1;
                         }
-                        match I_FILE_VERDICTS.iter().find(|(n, _, _)| *n == name) {
+                        match common::I_FILE_VERDICTS.iter().find(|(n, _, _)| *n == name) {
                             None => failures.push(format!(
-                                "{name}: new i_ file — add a pinned verdict to I_FILE_VERDICTS"
+                                "{name}: new i_ file — add a pinned verdict to common::I_FILE_VERDICTS"
                             )),
                             Some((_, want_accept, reason)) if *want_accept != parsed => {
                                 failures.push(format!(
@@ -313,7 +119,7 @@ fn jsontestsuite_verdicts() {
             "{name} is documented as rejected"
         );
     }
-    for (name, _, _) in I_FILE_VERDICTS {
+    for (name, _, _) in common::I_FILE_VERDICTS {
         assert!(
             dir.join(name).is_file(),
             "I_FILE_VERDICTS lists missing file {name} — corpus updated?"
@@ -339,4 +145,74 @@ fn jsontestsuite_verdicts() {
     );
     assert_eq!(y_pass, y_total, "every y_ file must parse");
     assert_eq!(n_pass, n_total, "every n_ file must be rejected");
+}
+
+/// The M4 error-contract completion: the **GPU backend** against the CPU
+/// reference on every file in the suite — the M3 three-way split (GPU
+/// accepts what only the scalar stages reject) collapsed to **two-way**.
+/// Every file must agree on the verdict; accepted files must produce
+/// bit-identical tapes and identical value trees. Rejected files compare
+/// WHETHER only: multi-error documents may legitimately differ in WHICH
+/// error is reported (GPU = earliest byte offset, reference = stage order
+/// — the documented relaxation; single-error code+offset parity is pinned
+/// in src/parser.rs / src/gpu/pipeline.rs).
+#[test]
+fn jsontestsuite_gpu_backend_matches_the_reference() {
+    let Some(dir) = common::jsontestsuite_dir() else {
+        return; // loud skip already printed
+    };
+    let Some(gpu) = common::gpu_parser_or_skip("jsontestsuite_gpu_backend_matches_the_reference")
+    else {
+        return;
+    };
+    let cpu = common::cpu_parser();
+
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for prefix in ["y_", "n_", "i_"] {
+        for path in common::jsontestsuite_files(&dir, prefix) {
+            let name = file_name(&path).to_owned();
+            let bytes = std::fs::read(&path).expect("readable corpus file");
+            let gpu_result = catch_unwind(AssertUnwindSafe(|| gpu.parse(&bytes)));
+            let Ok(gpu_result) = gpu_result else {
+                failures.push(format!("{name}: GPU backend PANICKED (must never happen)"));
+                continue;
+            };
+            match (gpu_result, cpu.parse(&bytes)) {
+                (Ok(gpu_doc), Ok(cpu_doc)) => {
+                    accepted += 1;
+                    assert_eq!(
+                        gpu_doc.tape(),
+                        cpu_doc.tape(),
+                        "{name}: tape words must be bit-identical"
+                    );
+                    common::assert_docs_eq(gpu_doc.root(), cpu_doc.root(), &name);
+                }
+                (Err(_), Err(_)) => rejected += 1, // verdict parity
+                (Ok(_), Err(e)) => {
+                    failures.push(format!("{name}: GPU accepted, reference rejected ({e})"));
+                }
+                (Err(e), Ok(_)) => {
+                    failures.push(format!("{name}: GPU rejected ({e}), reference accepted"));
+                }
+            }
+        }
+    }
+
+    println!(
+        "GPU two-way parity: {accepted} accepted on both, {rejected} rejected on both, \
+         {} disagreements",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} GPU/reference disagreements:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+    // Sanity: both halves of the two-way split are well represented (the
+    // suite has ~100 accepts incl. the accepted i_ files and ~215 rejects).
+    assert!(accepted >= 90, "only {accepted} files accepted — suite incomplete?");
+    assert!(rejected >= 180, "only {rejected} files rejected — suite incomplete?");
 }

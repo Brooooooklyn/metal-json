@@ -17,14 +17,27 @@
 //! scalar/string holes — the M4 kernels fill those). `stage3::run_structure`
 //! is the full M3 pipeline runner.
 //!
+//! M4 scope: [`numbers`] (K10: number grammar + Eisel-Lemire + literals,
+//! hard cases → CPU fixup) and [`strings`] (K11: record offsets +
+//! validation/unescape) as standalone kernel runners, plus [`pipeline`] —
+//! the **full GPU parse pipeline** that encodes K10/K11 into the same CB3
+//! as the structure kernels and completes the error contract. The parser's
+//! `Backend::Gpu` drives [`pipeline::GpuPipeline`]; everything else here is
+//! a narrower per-milestone test orchestration.
+//!
 //! Internal/unstable: exposed publicly so integration tests can drive the
 //! pipeline directly (like [`crate::metal`] and [`crate::stage`]), but not
 //! part of the supported API surface.
 
+pub mod numbers;
+pub mod pipeline;
 pub mod stage1;
 pub mod stage2;
 pub mod stage3;
+pub mod strings;
 
+pub use numbers::{ERR_NUMBER, Numbers, NumbersOutput, patch_number_fixups, run_numbers};
+pub use pipeline::{GpuParse, GpuParseOutput, GpuPipeline};
 pub use stage1::{ERR_STRING, ERR_UTF8, Stage1, Stage1Output, run_stage1};
 pub use stage2::{
     ERR_EMPTY_INPUT, ERR_INVALID_LITERAL, ERR_MISSING_COLON, ERR_MISSING_COMMA, ERR_UNBALANCED,
@@ -32,4 +45,7 @@ pub use stage2::{
 };
 pub use stage3::{
     ERR_DEPTH_LIMIT, ERR_TRAILING_CONTENT, NO_MATCH, Stage3, Stage3Output, run_stage3,
+};
+pub use strings::{
+    ERR_STRING_CONTROL, ERR_STRING_ESCAPE, StringsOutput, StringsStage, run_strings,
 };

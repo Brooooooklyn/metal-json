@@ -10,6 +10,10 @@
 //!   control chars — M4's classes) form an explicit three-way split: the
 //!   GPU must ACCEPT through M3, reference stages 1–4 must also accept,
 //!   and the FULL reference parse must reject (`Verdict::ScalarPending`).
+//!   (The split is a property of the structure-only `Stage3` runner under
+//!   test here; the full M4 pipeline collapses it to two-way — see
+//!   `jsontestsuite_gpu_backend_matches_the_reference` in
+//!   tests/jsontestsuite.rs.)
 //!   Accepted inputs compare tape length, the tape_ofs map, pair maps,
 //!   child counts and the container/root tape words bit-exactly at the
 //!   reference-designated positions (everything else is a zero-word hole).

@@ -1,0 +1,433 @@
+// 13_strings.metal — K11 `strings_unescape` + its offset feeder
+// `string_record_offsets`: the M4 string stage.
+//
+//   string_record_offsets  1 threadgroup / 1024-token chunk (the K6b shape):
+//                          refines the K7 per-chunk string carries into the
+//                          per-string record offsets — the exclusive prefix
+//                          sum of `raw_len + 5` over QuoteOpen tokens in
+//                          document order (docs/tape-format.md's pinned
+//                          offset-allocation policy). Pure token-position
+//                          math: it runs BEFORE any unescaping, which is
+//                          exactly why the policy uses raw lengths.
+//   strings_unescape       1 thread / string-list entry: validate + unescape
+//                          one string literal into its
+//                          [u32 LE len][content][NUL] record and write the
+//                          string tape word at tape_ofs[token]. Fast path:
+//                          16-byte blocks free of escapes / control bytes
+//                          are copied verbatim; escape path: sequential
+//                          unescape with full surrogate-pair validation.
+//   structure_finalize     (10_pair_ctx.metal, REUSED) 1 threadgroup:
+//                          min-fold the per-chunk K11 error words into
+//                          header.error.
+//
+// The bit-exact spec is the CPU oracle `reference::stage6_strings`
+// (src/reference/strings.rs): escapes `\" \\ \/ \b \f \n \r \t`,
+// `\uXXXX` (case-insensitive hex) including UTF-16 surrogate pairs, the
+// legal backslash-u-0000 interior NUL; rejected are lone/inverted surrogates, bad
+// or short hex, unknown escapes (all MJ_ERR_STRING_ESCAPE at the
+// backslash) and raw control bytes < 0x20 (MJ_ERR_STRING_CONTROL at the
+// byte). Each thread reports its string's FIRST (leftmost) error; string
+// extents are disjoint and in document order, so the packed-min reduction
+// reproduces the reference's first-error verdict exactly (and the two K11
+// codes can never tie at one offset: a byte is either a backslash or a
+// control character, never both).
+//
+// Geometry: `string_record_offsets` mirrors K6b (one 256-thread group per
+// MJ_TOK_CHUNK_TOKENS tokens, MJ_TOK_PER_THREAD each); `strings_unescape`
+// runs MJ_STR_CHUNK_STRINGS = 256 strings per threadgroup, one per thread.
+// Both dispatch as FULL threadgroups (Dispatch::Threadgroups) — the
+// cooperative scans / reductions below are convergent; out-of-range
+// threads contribute zeros / no-error and still reach every barrier.
+//
+// KNOWN PERF CLIFF (v1, documented decision): one thread owns one whole
+// string, so a single multi-KB string serializes on one lane while its 31
+// SIMD siblings idle (worst case: one giant escaped string = one thread
+// doing all the work). Correctness-first for M4; if M5 profiling shows it,
+// the valve goes HERE — bucket strings by raw length in the runner and
+// dispatch a `strings_unescape_tg` variant (one THREADGROUP per long
+// string: cooperative 16B-block copy for the no-escape prefix, lane 0
+// sequential for escape tails) for entries above a threshold, exactly like
+// K1's escape-carry valve splits rare hard cases out of the hot kernel.
+//
+// Memory safety: every write lands inside the exact-size allocations the
+// CPU made from the K7 totals — record bytes stay inside the record's own
+// `raw_len + 5` slot (unescaped output is never longer than raw input, the
+// reference's `bytes.len() <= raw.len()` invariant), and the tape word
+// lands at tape_ofs[token] < the tape length passed in reserved0 (checked
+// defensively). Gap bytes between a shrunk record's NUL and the next slot
+// are left UNSPECIFIED (never written) per the pinned gap policy.
+
+#include "common.h"
+#include "tape_types.h"
+#include "tg_scan.h"
+
+// --- M4 string error codes -------------------------------------------------------
+// Extend the MjErrorCode space (common.h tops out at MJ_ERR_EMPTY_INPUT =
+// 22). Defined here rather than in common.h so the M4 scalar kernels can
+// land independently; fold into the MjErrorCode enum at parser
+// integration. Mirror ERR_STRING_ESCAPE / ERR_STRING_CONTROL in
+// src/gpu/strings.rs — keep in sync (a Rust test parses this file and pins
+// them). No same-offset tie-break constraint exists for these codes (see
+// the header comment above), so their order is free.
+constant constexpr uint MJ_ERR_STRING_ESCAPE = 23;  // SyntaxErrorKind::InvalidStringEscape
+constant constexpr uint MJ_ERR_STRING_CONTROL = 24; // SyntaxErrorKind::ControlCharacterInString
+
+// Strings per K11 threadgroup: one per thread.
+constant constexpr uint MJ_STR_CHUNK_STRINGS = THREADGROUP_SIZE;
+
+// Fast-path block width in bytes (the vectorized clean-scan grain).
+constant constexpr uint MJ_STR_BLOCK = 16;
+
+// --- string_record_offsets ---------------------------------------------------------
+
+// One threadgroup per 1024-token chunk, 4 tokens per thread (the K6b
+// shape). For every QuoteOpen token, materialize the byte offset its
+// string record starts at:
+//
+//   offset = chunk_string_bytes[chunk]   (K7 exclusive chunk carry)
+//          + in-chunk exclusive prefix of slot bytes over earlier tokens
+//
+// written to record_offsets[rank] with rank = chunk_counts[chunk].z (the
+// K7 string-count carry) + the in-chunk exclusive string rank — the same
+// dense document-order ranks K6b used for string_tokens, so entry s of
+// the two arrays describes the same string. Slot bytes (`raw_len + 5`)
+// recompute mj_token_info's slot_bytes (06_validate.metal) from the same
+// inputs, so these offsets are exactly the K6/K7 partials' refinement;
+// the grand total equals header.stringbuf_total.
+//
+// The in-chunk slot prefix is 64-bit (one string literal can exceed u32);
+// like K7's string-byte scan it uses a 256-lane threadgroup ladder folded
+// serially by thread 0 — simdgroup scan intrinsics are 32-bit, and a
+// 256-step serial fold is noise at this grain.
+kernel void string_record_offsets(
+    device const uint* tok_pos [[buffer(0)]],
+    device const uchar* tok_kind [[buffer(1)]],
+    device const uint4* chunk_counts [[buffer(2)]],       // K7 exclusive carries
+    device const ulong* chunk_string_bytes [[buffer(3)]], // K7 exclusive carries
+    device ulong* record_offsets [[buffer(4)]],
+    constant MjParams& params [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint parts[9];
+    threadgroup ulong lanes[THREADGROUP_SIZE + 1];
+
+    ulong n = params.element_count; // token_total
+    ulong base = ulong(tgid) * ulong(MJ_TOK_CHUNK_TOKENS) + ulong(lid) * ulong(MJ_TOK_PER_THREAD);
+
+    bool is_str[MJ_TOK_PER_THREAD];
+    ulong slot[MJ_TOK_PER_THREAD];
+    uint str_sum = 0u;
+    ulong slot_sum = 0;
+    for (uint j = 0u; j < MJ_TOK_PER_THREAD; ++j) {
+        ulong t = base + ulong(j);
+        is_str[j] = false;
+        slot[j] = 0;
+        if (t < n && uint(tok_kind[t]) == MJ_TOK_QUOTE_OPEN) {
+            is_str[j] = true;
+            // The close quote is the very next token (post-CB1 even quote
+            // total); the t+1 guard is defensive only, mirroring
+            // mj_token_info. Slot = raw_len + 4-byte length prefix + NUL.
+            uint raw_len = (t + 1 < n) ? (tok_pos[t + 1] - tok_pos[t] - 1u) : 0u;
+            slot[j] = ulong(raw_len)
+                + ulong(MJ_STRING_RECORD_HEADER_BYTES + MJ_STRING_RECORD_TRAILER_BYTES);
+            str_sum += 1u;
+            slot_sum += slot[j];
+        }
+    }
+
+    // In-chunk exclusive string rank (32-bit cooperative scan).
+    uint rank = chunk_counts[tgid].z
+        + tg_exclusive_scan_256(str_sum, simd_lane, simd_id, parts);
+
+    // In-chunk exclusive slot-byte prefix (64-bit ladder).
+    lanes[lid] = slot_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        ulong run = 0;
+        for (uint k = 0u; k < THREADGROUP_SIZE; ++k) {
+            ulong v = lanes[k];
+            lanes[k] = run;
+            run += v;
+        }
+        lanes[THREADGROUP_SIZE] = run;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ulong offset = chunk_string_bytes[tgid] + lanes[lid];
+
+    for (uint j = 0u; j < MJ_TOK_PER_THREAD; ++j) {
+        if (is_str[j]) {
+            record_offsets[rank] = offset;
+            rank += 1u;
+            offset += slot[j];
+        }
+    }
+}
+
+// --- strings_unescape ----------------------------------------------------------------
+
+// 4 hex digits (case-insensitive) at raw[at..at+4], or -1 when short or
+// non-hex. Mirrors reference `hex4`.
+static inline int mj_str_hex4(device const uchar* raw, ulong at, ulong raw_len) {
+    if (at + 4 > raw_len) {
+        return -1;
+    }
+    int v = 0;
+    for (uint k = 0u; k < 4u; ++k) {
+        uchar c = raw[at + ulong(k)];
+        uint d;
+        if (c >= uchar('0') && c <= uchar('9')) {
+            d = uint(c - uchar('0'));
+        } else if (c >= uchar('a') && c <= uchar('f')) {
+            d = uint(c - uchar('a')) + 10u;
+        } else if (c >= uchar('A') && c <= uchar('F')) {
+            d = uint(c - uchar('A')) + 10u;
+        } else {
+            return -1;
+        }
+        v = v * 16 + int(d);
+    }
+    return v;
+}
+
+// Validate + unescape string-list entry `s`. On success writes the
+// [u32 LE len][content][NUL] record at record_offsets[s] and the string
+// tape word at tape_ofs[token], and returns MJ_HEADER_NO_ERROR; on the
+// string's first (leftmost) error returns the packed error word and
+// guarantees nothing about the record bytes (rejected outputs are never
+// read — the rejection contract). Mirrors reference `unescape` plus the
+// record/tape emission of `emit_tape`.
+static inline uint64_t mj_str_unescape_one(
+    device const uchar* input,
+    device const uint* tok_pos,
+    device const uint* string_tokens,
+    device const ulong* record_offsets,
+    device const uint* tape_ofs,
+    device uchar* stringbuf,
+    device ulong* tape,
+    ulong s,
+    ulong token_total,
+    ulong tape_words)
+{
+    ulong t = ulong(string_tokens[s]);
+    if (t + 1 >= token_total) {
+        // Defensive only: post-CB2 every QuoteOpen has an adjacent close.
+        return MJ_HEADER_NO_ERROR;
+    }
+    ulong open_pos = ulong(tok_pos[t]);
+    ulong close_pos = ulong(tok_pos[t + 1]);
+    ulong raw_len = close_pos - open_pos - 1;
+    device const uchar* raw = input + (open_pos + 1);
+    ulong base = open_pos + 1; // absolute offset of raw[0], for errors
+
+    ulong rec = record_offsets[s];
+    device uchar* dst = stringbuf + rec + ulong(MJ_STRING_RECORD_HEADER_BYTES);
+
+    ulong i = 0; // raw cursor
+    ulong o = 0; // content cursor (o <= i always: unescaping never grows)
+    while (i < raw_len) {
+        // FAST PATH: copy 16-byte blocks until one contains an escape or a
+        // control byte. Writes are eager (dst[o..o+16] = raw block) — safe
+        // because o + 16 <= i + 16 <= raw_len keeps them inside the
+        // record's content area, and a dirty block's bytes are overwritten
+        // by the careful steps below (or discarded with the whole output
+        // on an error).
+        while (i + ulong(MJ_STR_BLOCK) <= raw_len) {
+            bool clean = true;
+            for (uint k = 0u; k < MJ_STR_BLOCK; ++k) {
+                uchar b = raw[i + ulong(k)];
+                dst[o + ulong(k)] = b;
+                clean = clean && (b >= uchar(0x20)) && (b != uchar('\\'));
+            }
+            if (!clean) {
+                break;
+            }
+            i += ulong(MJ_STR_BLOCK);
+            o += ulong(MJ_STR_BLOCK);
+        }
+
+        // CAREFUL STEPS: handle up to one block's worth of units (bytes or
+        // whole escapes) before retrying the fast loop, bounding the
+        // re-scan cost at a dirty block to one extra 16-byte check.
+        for (uint step = 0u; step < MJ_STR_BLOCK && i < raw_len; ++step) {
+            uchar b = raw[i];
+            if (b < uchar(0x20)) {
+                // Raw control characters must be escaped.
+                return mj_pack_error(base + i, MjErrorCode(MJ_ERR_STRING_CONTROL));
+            }
+            if (b != uchar('\\')) {
+                // UTF-8 continuation bytes were validated in stage 1; copy
+                // verbatim. (An unescaped `"` cannot appear: the extent
+                // ends at the first unescaped quote.)
+                dst[o] = b;
+                o += 1;
+                i += 1;
+                continue;
+            }
+
+            // Escape errors point at the backslash (reference parity).
+            uint64_t esc = mj_pack_error(base + i, MjErrorCode(MJ_ERR_STRING_ESCAPE));
+            if (i + 1 >= raw_len) {
+                // A trailing lone backslash cannot occur via stages 1-3
+                // (it would have escaped the closing quote); stay graceful.
+                return esc;
+            }
+            uchar d = raw[i + 1];
+            switch (d) {
+                case '"':
+                case '\\':
+                case '/':
+                    dst[o] = d;
+                    o += 1;
+                    i += 2;
+                    break;
+                case 'b':
+                    dst[o] = uchar(0x08);
+                    o += 1;
+                    i += 2;
+                    break;
+                case 'f':
+                    dst[o] = uchar(0x0C);
+                    o += 1;
+                    i += 2;
+                    break;
+                case 'n':
+                    dst[o] = uchar(0x0A);
+                    o += 1;
+                    i += 2;
+                    break;
+                case 'r':
+                    dst[o] = uchar(0x0D);
+                    o += 1;
+                    i += 2;
+                    break;
+                case 't':
+                    dst[o] = uchar(0x09);
+                    o += 1;
+                    i += 2;
+                    break;
+                case 'u': {
+                    int first = mj_str_hex4(raw, i + 2, raw_len);
+                    if (first < 0) {
+                        return esc; // short or non-hex digits
+                    }
+                    uint cp;
+                    ulong consumed;
+                    if (first >= 0xD800 && first <= 0xDBFF) {
+                        // High surrogate: must be chased by a low-surrogate
+                        // escape.
+                        if (i + 8 > raw_len || raw[i + 6] != uchar('\\')
+                            || raw[i + 7] != uchar('u')) {
+                            return esc;
+                        }
+                        int low = mj_str_hex4(raw, i + 8, raw_len);
+                        if (low < 0xDC00 || low > 0xDFFF) {
+                            return esc; // bad hex or not a low surrogate
+                        }
+                        cp = 0x10000u + ((uint(first) - 0xD800u) << 10)
+                            + (uint(low) - 0xDC00u);
+                        consumed = 12;
+                    } else if (first >= 0xDC00 && first <= 0xDFFF) {
+                        // Lone / inverted low surrogate.
+                        return esc;
+                    } else {
+                        cp = uint(first);
+                        consumed = 6;
+                    }
+                    // UTF-8 encode (cp <= 0x10FFFF and never a surrogate
+                    // by construction).
+                    if (cp < 0x80u) {
+                        dst[o] = uchar(cp);
+                        o += 1;
+                    } else if (cp < 0x800u) {
+                        dst[o] = uchar(0xC0u | (cp >> 6));
+                        dst[o + 1] = uchar(0x80u | (cp & 0x3Fu));
+                        o += 2;
+                    } else if (cp < 0x10000u) {
+                        dst[o] = uchar(0xE0u | (cp >> 12));
+                        dst[o + 1] = uchar(0x80u | ((cp >> 6) & 0x3Fu));
+                        dst[o + 2] = uchar(0x80u | (cp & 0x3Fu));
+                        o += 3;
+                    } else {
+                        dst[o] = uchar(0xF0u | (cp >> 18));
+                        dst[o + 1] = uchar(0x80u | ((cp >> 12) & 0x3Fu));
+                        dst[o + 2] = uchar(0x80u | ((cp >> 6) & 0x3Fu));
+                        dst[o + 3] = uchar(0x80u | (cp & 0x3Fu));
+                        o += 4;
+                    }
+                    i += consumed;
+                    break;
+                }
+                default:
+                    // Unknown escapes (`\q`, `\x41`, `\u{1F600}`, ...).
+                    return esc;
+            }
+        }
+    }
+
+    // The record: [u32 LE length][content][NUL]. The length counts content
+    // bytes only; byte stores because `rec` has no alignment guarantee
+    // (slots are raw_len + 5). o <= raw_len < 2^32, so the cast is exact.
+    uint len = uint(o);
+    stringbuf[rec] = uchar(len & 0xFFu);
+    stringbuf[rec + 1] = uchar((len >> 8) & 0xFFu);
+    stringbuf[rec + 2] = uchar((len >> 16) & 0xFFu);
+    stringbuf[rec + 3] = uchar((len >> 24) & 0xFFu);
+    dst[o] = uchar(0);
+
+    // The string tape word at this token's tape position.
+    ulong pos = ulong(tape_ofs[t]);
+    if (pos < tape_words) { // defensive; always true on accepted inputs
+        tape[pos] = mj_make_string(rec);
+    }
+    return MJ_HEADER_NO_ERROR;
+}
+
+// K11: one thread per string-list entry, MJ_STR_CHUNK_STRINGS entries per
+// threadgroup. Validates + unescapes every string, writes the records and
+// string tape words, and min-reduces one packed error word per chunk into
+// chunk_error (thread 0 plain store, no device atomics — the K6 pattern);
+// `structure_finalize` folds those into header.error afterwards.
+//
+//   params.element_count = string_total
+//   params.reserved0     = tape length in words (defensive bound)
+//   params.reserved1     = token_total (defensive bound)
+kernel void strings_unescape(
+    device const uchar* input [[buffer(0)]],
+    device const uint* tok_pos [[buffer(1)]],
+    device const uint* string_tokens [[buffer(2)]],
+    device const ulong* record_offsets [[buffer(3)]],
+    device const uint* tape_ofs [[buffer(4)]],
+    device uchar* stringbuf [[buffer(5)]],
+    device ulong* tape [[buffer(6)]],
+    device ulong* chunk_error [[buffer(7)]],
+    constant MjParams& params [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    threadgroup ulong lanes[THREADGROUP_SIZE];
+
+    ulong n = params.element_count; // string_total
+    ulong s = ulong(tgid) * ulong(MJ_STR_CHUNK_STRINGS) + ulong(lid);
+
+    uint64_t err = MJ_HEADER_NO_ERROR;
+    if (s < n) {
+        err = mj_str_unescape_one(input, tok_pos, string_tokens, record_offsets,
+                                  tape_ofs, stringbuf, tape, s,
+                                  params.reserved1, params.reserved0);
+    }
+
+    // Deterministic per-chunk min (every thread reaches the barrier; the
+    // helper above returns rather than exiting the kernel).
+    lanes[lid] = err;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        uint64_t chunk_min = MJ_HEADER_NO_ERROR;
+        for (uint k = 0u; k < THREADGROUP_SIZE; ++k) {
+            chunk_min = min(chunk_min, lanes[k]);
+        }
+        chunk_error[tgid] = chunk_min;
+    }
+}

@@ -14,20 +14,28 @@ versus ~3–7 GB/s for CPU SIMD parsers like simdjson. The goal: **faster than
 C++ simdjson parse-to-tape on large inputs (100MB–1GB)**, with the CPU/GPU
 crossover point documented honestly.
 
-## Status: WIP (milestone M0 — scaffold)
+## Status: WIP (milestone M4 — the GPU parser is end-to-end)
 
 Working today:
 
+- **The full GPU parser**: `Parser::new()?` (acquires the Metal device;
+  `Backend::Gpu` is the default) → `parser.parse(&bytes)?` → `Document` /
+  `Value` navigation. All 13 kernels (classify/escape/UTF-8 → scans → token
+  scatter → validation/footprints → depth sort → bracket pairing →
+  container tape words → number parse with Eisel-Lemire f64 bit patterns +
+  CPU fixups for the hard roundings → string validation/unescape) across 3
+  command buffers with exact-size allocations at each CPU sync.
+- Every error class at reference parity (JSONTestSuite 318/318 two-way vs
+  the scalar `cpu-reference` oracle, which remains available as an explicit
+  backend behind the `cpu-reference` feature).
 - AOT shader pipeline: `shaders/*.metal` → `metal_json.metallib` in build.rs,
   embedded into the binary (`runtime-shaders` feature switches to runtime MSL
   compilation with `METAL_JSON_SHADER_DIR` hot reload).
 - Safe wrapper layer over `objc2-metal` (`src/metal/`): context, compute
-  pipelines, shared-storage buffers, synchronous dispatch helper.
-- GPU smoke tests (`cargo test`) proving 32-bit and 64-bit integer kernels
-  end to end.
+  pipelines, shared-storage buffers, multi-dispatch command batches.
 
-The parser itself (`Parser` / `Document` / `Value`) lands over milestones
-M1–M5. Full design:
+M5 (benchmarks vs vendored C++ simdjson, buffer pooling, zero-copy input
+and `Document`s, per-kernel timing) is next. Full design:
 [`docs/superpowers/specs/2026-06-10-metal-json-design.md`](docs/superpowers/specs/2026-06-10-metal-json-design.md).
 
 ## Requirements

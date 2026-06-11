@@ -107,6 +107,7 @@ mod runtime {
         ("tape_types.h", include_str!("../../shaders/tape_types.h")),
         ("bitmap_u2.h", include_str!("../../shaders/bitmap_u2.h")),
         ("tg_scan.h", include_str!("../../shaders/tg_scan.h")),
+        ("pow5_table.h", include_str!("../../shaders/pow5_table.h")),
         (
             "00_smoke.metal",
             include_str!("../../shaders/00_smoke.metal"),
@@ -154,6 +155,14 @@ mod runtime {
         (
             "11_emit.metal",
             include_str!("../../shaders/11_emit.metal"),
+        ),
+        (
+            "12_numbers.metal",
+            include_str!("../../shaders/12_numbers.metal"),
+        ),
+        (
+            "13_strings.metal",
+            include_str!("../../shaders/13_strings.metal"),
         ),
     ];
 
