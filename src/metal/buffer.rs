@@ -217,3 +217,8 @@ macro_rules! impl_pod {
 }
 
 impl_pod!(u8, u16, u32, u64, i8, i16, i32, i64, f32);
+
+impl private::Sealed for super::MjHeader {}
+// SAFETY: `MjHeader` is a #[repr(C)] struct of eight u64 fields: no padding,
+// no pointers, and every bit pattern is a valid value.
+unsafe impl Pod for super::MjHeader {}

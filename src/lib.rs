@@ -5,18 +5,25 @@
 //! memory (`bytesNoCopy`, zero copy) to beat CPU SIMD parsers on large
 //! (MBs–GB) inputs.
 //!
-//! ## Status: M1 (work in progress)
+//! ## Status: M2 (work in progress)
 //!
 //! What exists today: the build pipeline (AOT `.metal` → metallib in
 //! build.rs, or runtime MSL compilation behind the `runtime-shaders`
-//! feature), the safe wrapper layer over `objc2-metal` in [`metal`], the
-//! [`Error`] type, GPU smoke tests, and the **tape format v1** foundation in
+//! feature), the safe wrapper layer over `objc2-metal` in [`metal`]
+//! (including multi-dispatch [`metal::CommandBatch`] encoding), the
+//! [`Error`] type, GPU smoke tests, the **tape format v1** foundation in
 //! [`tape`] (constants + encode/decode helpers + buffers, locked to
-//! `shaders/tape_types.h` by a layout test; spec in `docs/tape-format.md`).
-//! [`Parser`], [`Document`], [`Value`] and the `cpu-reference` oracle are
-//! compiling M1 stubs being filled in now; the GPU pipeline lands over
-//! M2–M5 — see `docs/superpowers/specs/2026-06-10-metal-json-design.md` for
-//! the full design.
+//! `shaders/tape_types.h` by a layout test; spec in `docs/tape-format.md`),
+//! the full `cpu-reference` oracle behind [`Parser`]/[`Document`]/[`Value`],
+//! the M2 kernel infrastructure in [`stage`] (per-stage encode abstraction,
+//! single-stage test harness, stage-1 buffer container) with the
+//! `shaders/bitmap_u2.h` uint2 64-bit vocabulary and its GPU self-test, and
+//! the **stage-1 GPU kernels K1–K5** (classify + escape + UTF-8, escape
+//! valve, spine scans, token mask, token scatter) orchestrated by
+//! [`gpu::Stage1`] and diffed bit-for-bit against the oracle in
+//! `tests/kernels.rs`. The structural and scalar kernels land over M3–M5 —
+//! see `docs/superpowers/specs/2026-06-10-metal-json-design.md` for the
+//! design.
 //!
 //! ## Feature flags
 //!
@@ -29,8 +36,10 @@
 mod error;
 
 pub mod document;
+pub mod gpu;
 pub mod metal;
 pub mod parser;
+pub mod stage;
 pub mod tape;
 pub mod value;
 

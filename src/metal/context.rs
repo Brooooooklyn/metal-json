@@ -105,9 +105,31 @@ mod runtime {
     const EMBEDDED: &[(&str, &str)] = &[
         ("common.h", include_str!("../../shaders/common.h")),
         ("tape_types.h", include_str!("../../shaders/tape_types.h")),
+        ("bitmap_u2.h", include_str!("../../shaders/bitmap_u2.h")),
+        ("tg_scan.h", include_str!("../../shaders/tg_scan.h")),
         (
             "00_smoke.metal",
             include_str!("../../shaders/00_smoke.metal"),
+        ),
+        (
+            "01_u2_selftest.metal",
+            include_str!("../../shaders/01_u2_selftest.metal"),
+        ),
+        (
+            "02_classify.metal",
+            include_str!("../../shaders/02_classify.metal"),
+        ),
+        (
+            "03_spine.metal",
+            include_str!("../../shaders/03_spine.metal"),
+        ),
+        (
+            "04_token_mask.metal",
+            include_str!("../../shaders/04_token_mask.metal"),
+        ),
+        (
+            "05_token_scatter.metal",
+            include_str!("../../shaders/05_token_scatter.metal"),
         ),
     ];
 
