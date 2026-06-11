@@ -1,0 +1,10 @@
+[package]
+name = "metal-json-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Minimal stub so the workspace builds. The real benchmark harness
+# (criterion + vendored C++ simdjson via `cc`, Rust simd-json, serde_json)
+# lands in M5.
+[dependencies]

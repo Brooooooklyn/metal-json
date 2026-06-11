@@ -1,0 +1,37 @@
+[workspace]
+members = [".", "bench", "xtask"]
+resolver = "3"
+
+[package]
+name = "metal-json"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "GPU JSON parser on Apple Metal: parse-to-tape faster than simdjson on large inputs"
+repository = "https://github.com/Brooooooklyn/metal-json"
+include = ["src/**", "shaders/**", "build.rs", "README.md"]
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+memmap2 = "0.9"
+thiserror = "2"
+
+[features]
+default = []
+# Compile MSL at runtime instead of embedding an AOT-built metallib.
+# Enables shader hot-reload via METAL_JSON_SHADER_DIR and supports machines
+# without the Xcode Metal toolchain.
+runtime-shaders = []
+# Scalar CPU oracle backend (lands in M1).
+cpu-reference = []
+# Per-kernel GPU timing via MTLCounterSampleBuffer (lands in M5).
+timing = []
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+proptest = "1"

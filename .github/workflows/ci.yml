@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # macos-15 runners are Apple Silicon with a real Metal GPU.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+        env:
+          MTL_SHADER_VALIDATION: "1"
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
