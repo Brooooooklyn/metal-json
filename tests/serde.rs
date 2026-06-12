@@ -223,3 +223,141 @@ fn deserialization_errors_preserve_serde_semantics() {
         "serde must reject out-of-range numbers"
     );
 }
+
+#[test]
+fn map_keys_parse_for_integer_bool_and_newtype_targets() {
+    let parser = common::cpu_parser();
+
+    let by_id: BTreeMap<u32, String> = parser
+        .parse_deserialize(br#"{"1":"a","2":"b"}"#)
+        .expect("integer-keyed map");
+    assert_eq!(
+        by_id,
+        BTreeMap::from([(1, "a".to_owned()), (2, "b".to_owned())])
+    );
+
+    let negative: BTreeMap<i64, u8> = parser
+        .parse_deserialize(br#"{"-7":1}"#)
+        .expect("signed integer key");
+    assert_eq!(negative, BTreeMap::from([(-7, 1)]));
+
+    let by_flag: BTreeMap<bool, i64> = parser
+        .parse_deserialize(br#"{"true":1,"false":0}"#)
+        .expect("bool-keyed map");
+    assert_eq!(by_flag, BTreeMap::from([(true, 1), (false, 0)]));
+
+    #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+    struct Id(String);
+
+    let by_newtype: BTreeMap<Id, u8> = parser
+        .parse_deserialize(br#"{"a":1}"#)
+        .expect("newtype-keyed map");
+    assert_eq!(by_newtype, BTreeMap::from([(Id("a".to_owned()), 1)]));
+
+    // Unparseable keys still hit the target type's own error.
+    assert!(
+        parser
+            .parse_deserialize::<BTreeMap<u32, u8>>(br#"{"x":1}"#)
+            .is_err(),
+        "non-numeric key must not deserialize as u32"
+    );
+}
+
+#[test]
+fn structs_accept_positional_arrays() {
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Point {
+        x: u8,
+        y: u8,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    enum Shape {
+        Vertex { x: u8, y: u8 },
+    }
+
+    let parser = common::cpu_parser();
+
+    let point: Point = parser
+        .parse_deserialize(b"[1,2]")
+        .expect("positional struct");
+    assert_eq!(point, Point { x: 1, y: 2 });
+
+    let vertex: Shape = parser
+        .parse_deserialize(br#"{"Vertex":[3,4]}"#)
+        .expect("positional struct variant");
+    assert_eq!(vertex, Shape::Vertex { x: 3, y: 4 });
+
+    let err = parser
+        .parse_deserialize::<Point>(br#""nope""#)
+        .expect_err("string is not a struct");
+    assert!(
+        err.to_string().contains("expected object or array"),
+        "unexpected struct error: {err}"
+    );
+}
+
+#[test]
+fn tuples_reject_arrays_with_extra_elements() {
+    let parser = common::cpu_parser();
+
+    let pair: (i64, i64) = parser.parse_deserialize(b"[1,2]").expect("exact tuple");
+    assert_eq!(pair, (1, 2));
+
+    let err = parser
+        .parse_deserialize::<(i64, i64)>(b"[1,2,3]")
+        .expect_err("extra elements must not be dropped");
+    assert!(
+        err.to_string()
+            .contains("invalid length 3, expected fewer elements in array"),
+        "unexpected tuple error: {err}"
+    );
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Pair(i64, i64);
+
+    assert!(
+        parser.parse_deserialize::<Pair>(b"[1,2,3]").is_err(),
+        "tuple structs must also reject extra elements"
+    );
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    enum E {
+        T(i64, i64),
+    }
+
+    assert!(
+        parser.parse_deserialize::<E>(br#"{"T":[1,2,3]}"#).is_err(),
+        "tuple variants must also reject extra elements"
+    );
+}
+
+#[test]
+fn i128_u128_exact_within_u64_range_and_error_beyond() {
+    let parser = common::cpu_parser();
+
+    // Exact through u64::MAX — no precision loss above 2^53.
+    let above_2_53: u128 = parser
+        .parse_deserialize(b"9007199254740995")
+        .expect("u128 above 2^53");
+    assert_eq!(above_2_53, 9_007_199_254_740_995);
+
+    let max: u128 = parser
+        .parse_deserialize(b"18446744073709551615")
+        .expect("u128 at u64::MAX");
+    assert_eq!(max, u64::MAX as u128);
+
+    let min: i128 = parser
+        .parse_deserialize(b"-9223372036854775808")
+        .expect("i128 at i64::MIN");
+    assert_eq!(min, i64::MIN as i128);
+
+    // Beyond u64::MAX the tape holds an f64, which 128-bit targets reject.
+    let err = parser
+        .parse_deserialize::<u128>(b"18446744073709551616")
+        .expect_err("beyond-u64 integers were stored as f64");
+    assert!(
+        err.to_string().contains("invalid type: floating point"),
+        "unexpected u128 error: {err}"
+    );
+}

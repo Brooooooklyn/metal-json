@@ -8,8 +8,8 @@
 //! patches, tape copy-out)?
 //!
 //! With the feature enabled, every [`GpuPipeline::run`]
-//! (and the `Parser::parse` copy-out around it) records one [`Phase`] per
-//! pipeline segment into a thread-local; [`take_parse_timings`] hands the
+//! (and the `Parser::parse` copy-out around it) records one `Phase` per
+//! pipeline segment into a thread-local; `take_parse_timings` hands the
 //! finished list to the caller (see `examples/parse_breakdown.rs`).
 //! Without the feature every helper is an inlined no-op and the pipeline
 //! pays nothing.

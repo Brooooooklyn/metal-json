@@ -47,6 +47,10 @@
 //! - `cpu-reference` — scalar CPU oracle backend (M1); when enabled it is
 //!   also the *default*-backend fallback on machines without Metal.
 //! - `timing` — per-kernel GPU timing via `MTLCounterSampleBuffer` (M5).
+//! - `serde` — deserialize parsed [`Document`]/[`Value`] cursors into serde
+//!   data models (the `serde` module, `Document::deserialize`,
+//!   `Value::deserialize`, `Parser::parse_deserialize`); avoids an
+//!   intermediate `serde_json::Value` but does not skip JSON parsing itself.
 
 mod error;
 mod input;
