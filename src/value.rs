@@ -259,6 +259,22 @@ impl<'doc> Value<'doc> {
         }
     }
 
+    /// The raw stored child count from the open word, saturated at
+    /// [`CONTAINER_COUNT_MAX`] ("this many or more"); `None` for scalars.
+    ///
+    /// Always O(1) — unlike [`len`](Self::len), a saturated count is
+    /// returned as-is instead of triggering a walk for the exact count.
+    /// Used by the serde accessors, which prefer no size hint over a
+    /// pre-walk of huge containers.
+    #[cfg(feature = "serde")]
+    pub(crate) fn raw_container_count(&self) -> Option<u32> {
+        let word = self.word();
+        match tape::tag(word) {
+            TAG_START_OBJECT | TAG_START_ARRAY => Some(tape::container_count(word)),
+            _ => None,
+        }
+    }
+
     /// Deserialize this value into a serde data model.
     ///
     /// The returned value may borrow strings from the backing

@@ -274,7 +274,7 @@ pub struct Stage1Buffers {
     /// continuation byte) at the same offset the reference reports.
     /// Kernels still mask the tail word by `input_len` (defense in depth).
     ///
-    /// The zero-copy path ([`Stage1Buffers::with_external_input`]) instead
+    /// The zero-copy path (`Stage1Buffers::with_external_input`) instead
     /// wraps caller-held page-aligned memory via
     /// [`GpuBuffer::from_page_aligned`]; that caller guarantees the same
     /// space-padding invariant for the tail word.

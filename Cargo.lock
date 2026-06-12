@@ -519,6 +519,7 @@ dependencies = [
  "cc",
  "criterion",
  "metal-json",
+ "serde",
  "serde_json",
  "simd-json",
 ]
