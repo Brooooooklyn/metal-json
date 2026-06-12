@@ -218,18 +218,7 @@ impl<'de> de::Deserializer<'de> for Value<'de> {
         if self.kind() != ValueKind::Array {
             return Err(invalid_type(self, "array"));
         }
-        let mut access = ArrayAccess::new(self)?;
-        let tuple = visitor.visit_seq(&mut access)?;
-        // Tuple visitors stop after `len` elements, so extras would be
-        // silently dropped; reject them like serde_json does.
-        if access.iter.next().is_none() {
-            Ok(tuple)
-        } else {
-            Err(DeserializeError::invalid_length(
-                self.len().unwrap_or(len),
-                &"fewer elements in array",
-            ))
-        }
+        visit_seq_exact(self, len, visitor)
     }
 
     fn deserialize_tuple_struct<V>(
@@ -258,7 +247,7 @@ impl<'de> de::Deserializer<'de> for Value<'de> {
     fn deserialize_struct<V>(
         self,
         _name: &'static str,
-        _fields: &'static [&'static str],
+        fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value>
     where
@@ -268,7 +257,7 @@ impl<'de> de::Deserializer<'de> for Value<'de> {
         // declaration order as well as the usual keyed object.
         match self.kind() {
             ValueKind::Object => visitor.visit_map(ObjectAccess::new(self)?),
-            ValueKind::Array => visitor.visit_seq(ArrayAccess::new(self)?),
+            ValueKind::Array => visit_seq_exact(self, fields.len(), visitor),
             _ => Err(invalid_type(self, "object or array")),
         }
     }
@@ -414,6 +403,26 @@ impl<'de> de::Deserializer<'de> for Value<'de> {
 
     ::serde::forward_to_deserialize_any! {
         i8 i16 i32 i128 u8 u16 u32 u128 f32 char
+    }
+}
+
+/// Drive `visitor.visit_seq` over `value`'s elements and reject any the
+/// visitor did not consume. Tuple and positional-struct visitors stop after
+/// their declared arity, so extras would otherwise be silently dropped;
+/// serde_json rejects them when it expects the closing `]`.
+fn visit_seq_exact<'de, V>(value: Value<'de>, len: usize, visitor: V) -> Result<V::Value>
+where
+    V: Visitor<'de>,
+{
+    let mut access = ArrayAccess::new(value)?;
+    let out = visitor.visit_seq(&mut access)?;
+    if access.iter.next().is_none() {
+        Ok(out)
+    } else {
+        Err(DeserializeError::invalid_length(
+            value.len().unwrap_or(len),
+            &"fewer elements in array",
+        ))
     }
 }
 
@@ -631,14 +640,14 @@ impl<'de> VariantAccess<'de> for ExternalVariant<'de> {
         self.value.deserialize_tuple(len, visitor)
     }
 
-    fn struct_variant<V>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value>
+    fn struct_variant<V>(self, fields: &'static [&'static str], visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
         // Same object-or-positional-array acceptance as deserialize_struct.
         match self.value.kind() {
             ValueKind::Object => visitor.visit_map(ObjectAccess::new(self.value)?),
-            ValueKind::Array => visitor.visit_seq(ArrayAccess::new(self.value)?),
+            ValueKind::Array => visit_seq_exact(self.value, fields.len(), visitor),
             _ => Err(invalid_type(self.value, "object or array")),
         }
     }

@@ -295,6 +295,25 @@ fn structs_accept_positional_arrays() {
         err.to_string().contains("expected object or array"),
         "unexpected struct error: {err}"
     );
+
+    // Positional inputs are exact-arity, like tuples: extras are rejected,
+    // not silently dropped.
+    let err = parser
+        .parse_deserialize::<Point>(b"[1,2,3]")
+        .expect_err("extra positional struct field");
+    assert!(
+        err.to_string()
+            .contains("invalid length 3, expected fewer elements in array"),
+        "unexpected extra-element error: {err}"
+    );
+    let err = parser
+        .parse_deserialize::<Shape>(br#"{"Vertex":[3,4,5]}"#)
+        .expect_err("extra positional struct-variant field");
+    assert!(
+        err.to_string()
+            .contains("invalid length 3, expected fewer elements in array"),
+        "unexpected extra-element error: {err}"
+    );
 }
 
 #[test]
