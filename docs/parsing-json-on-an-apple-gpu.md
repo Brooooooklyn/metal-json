@@ -1,21 +1,22 @@
-# metal-json: parsing huge JSON on an Apple GPU
+# metal-json: parsing huge JSON on an Apple GPU faster than simdjson
+
+> [metal-json GitHub repo](https://github.com/Brooooooklyn/metal-json)
 
 JSON parsing is supposed to be the worst possible workload for a GPU. The grammar is a chain of data-dependent branches. Strings can contain escaped quotes that change the meaning of every byte after them. Brackets match by a stack, and a stack is the textbook example of sequential state. Every byte's meaning depends on every byte before it.
 
 I built a JSON parser that runs on the GPU of a Mac anyway. It is called metal-json. It parses standard JSON to a simdjson-compatible 64-bit tape — the same flat output format the fastest CPU parser produces — using Metal compute kernels on Apple Silicon. On large documents it beats C++ simdjson, the parser it borrows its output format from. On small documents it loses, badly, and I want to show that part first:
 
-```
-dataset       size       metal-json   simdjson-cpp   vs simdjson   winner
-twitter       0.6 MiB    1.287 ms     0.159 ms       0.12x         simdjson
-twitter_1m    1.0 MiB    1.009 ms     0.328 ms       0.33x         simdjson
-twitter_4m    4.0 MiB    1.435 ms     1.385 ms       0.96x         simdjson
-twitter_8m    8.0 MiB    1.955 ms     2.615 ms       1.34x         metal-json
-twitter_16m   16.0 MiB   3.383 ms     6.129 ms       1.81x         metal-json
-twitter_64m   64.0 MiB   10.465 ms    23.852 ms      2.28x         metal-json
-twitter_100m  100.0 MiB  16.386 ms    33.772 ms      2.06x         metal-json
-twitter_256m  256.0 MiB  37.654 ms    82.308 ms      2.19x         metal-json
-twitter_512m  512.0 MiB  71.447 ms    193.711 ms     2.71x         metal-json
-```
+| dataset      | size      | metal-json | simdjson-cpp | vs simdjson | winner      |
+| ------------ | --------- | ---------- | ------------ | ----------- | ----------- |
+| twitter      | 0.6 MiB   | 1.287 ms   | 0.159 ms     | 0.12x       | simdjson    |
+| twitter_1m   | 1.0 MiB   | 1.009 ms   | 0.328 ms     | 0.33x       | simdjson    |
+| twitter_4m   | 4.0 MiB   | 1.435 ms   | 1.385 ms     | 0.96x       | simdjson    |
+| twitter_8m   | 8.0 MiB   | 1.955 ms   | 2.615 ms     | 1.34x       | metal-json  |
+| twitter_16m  | 16.0 MiB  | 3.383 ms   | 6.129 ms     | 1.81x       | metal-json  |
+| twitter_64m  | 64.0 MiB  | 10.465 ms  | 23.852 ms    | 2.28x       | metal-json  |
+| twitter_100m | 100.0 MiB | 16.386 ms  | 33.772 ms    | 2.06x       | metal-json  |
+| twitter_256m | 256.0 MiB | 37.654 ms  | 82.308 ms    | 2.19x       | metal-json  |
+| twitter_512m | 512.0 MiB | 71.447 ms  | 193.711 ms   | 2.71x       | metal-json  |
 
 Criterion medians, one Apple M5 Max (128 GiB unified memory, macOS 26.5.1), simdjson v4.6.4 built with `-O3 -mcpu=native`, both parsers timed doing the same work, both verified to produce bit-identical results before timing. The crossover on this sweep is about 4.3 MiB — the report says to treat it as a band that moves with document shape and machine, and the README rounds it to 4–5 MiB. Below it, the GPU's fixed dispatch and sync overhead dominates — at 0.6 MiB the GPU runs at 0.12x, meaning simdjson is about 8x faster. Above it, metal-json wins 2.1–2.7x on 100–512 MiB twitter-shaped inputs, and the gap widens with size. Document shape matters too: number-dense `canada.json` already favors the GPU at 2.1 MiB (1.42x), while `citm_catalog` at 1.6 MiB favors simdjson (0.44x).
 
@@ -49,7 +50,7 @@ All numbers below: Apple M5 Max, Metal toolchain 32023.883, medians over multipl
 
 Float parsing via the Eisel–Lemire algorithm needs full 128-bit products. Three candidate formulations, measured over 2^26 dependent multiply chains with the memory traffic cancelled out arithmetically:
 
-```
+```bash
 variant                                    ALU-isolated mul128/s
 mulhi(ulong) builtin + x*y                 3.76e11
 limbs32  (pure 4-limb 32-bit, bool carry)  3.82e11
@@ -64,11 +65,10 @@ A side measurement (Q3) shaped the rest of the kernels: a rotate/popcount-heavy 
 
 The bitmap kernels keep one 64-bit mask per 64 input bytes. Should that mask be a native `ulong` (emulated on 32-bit ALUs) or an explicit `uint2` pair with hand-written carries? Two kernels doing identical simdjson-stage-1-style work over 1 GiB of input:
 
-```
-config                ulong                  uint2                  ratio
-rounds=1 (K1 mix)     4.507 ms (238 GB/s)    2.198 ms (489 GB/s)    2.05x
-rounds=8 (ALU-heavy)  5.351 ms (201 GB/s)    2.715 ms (395 GB/s)    1.97x
-```
+| config               | ulong (time/bandwidth)    | uint2 (time/bandwidth)   | ratio  |
+|----------------------|--------------------------|---------------------------|--------|
+| rounds=1 (K1 mix)    | 4.507 ms (238 GB/s)      | 2.198 ms (489 GB/s)       | 2.05x  |
+| rounds=8 (ALU-heavy) | 5.351 ms (201 GB/s)      | 2.715 ms (395 GB/s)       | 1.97x  |
 
 The `uint2` variant reaches ~550 GB/s of total memory traffic — it turns the kernel memory-bandwidth-bound — "while the ulong variant is ALU-bound at under half that, so the emulated 64-bit ops cost more than the entire memory traffic of the kernel." The spike doc also recorded the texture of the runs: the `ulong` medians wobbled ~10% between process runs while `uint2` was stable within 1%, and the two variants' outputs matched bit-for-bit, with identical XOR checksums across runs. Decision: every hot bitmap is `uint2`. The compromise is a hand-maintained helper header (`shl64_u2`, `add64_u2` with carry-out, `prefix_xor64_u2`, ...) instead of native operators.
 
@@ -78,13 +78,12 @@ The rejected alternative got a consolation job. The `uint2` self-test kernel del
 
 The planned pipeline was 3 command buffers (batches of GPU work submitted together), ~14 kernel dispatches, 2 CPU synchronization points. Measured fixed costs:
 
-```
-scenario                                   wall            GPU
-empty command buffer, commit+wait          18.7–20.1 us    n/a
-one CB, 14 tiny dispatches                 219–421 us      29–53 us
-planned 3-CB shape + 3 waits               497–533 us      31–38 us
-16Mi-thread no-op dispatch                 ~160 us         (~2.4 ns per 256-thread group)
-```
+| Scenario                                 | Wall Time         | GPU Time                       |
+|------------------------------------------|-------------------|--------------------------------|
+| empty command buffer, commit+wait        | 18.7–20.1 µs      | n/a                            |
+| one CB, 14 tiny dispatches               | 219–421 µs        | 29–53 µs                       |
+| planned 3-CB shape + 3 waits             | 497–533 µs        | 31–38 µs                       |
+| 16Mi-thread no-op dispatch               | ~160 µs           | (~2.4 ns per 256-thread group) |
 
 Three rules fell out, and all three are quoted in source comments to this day:
 
@@ -94,13 +93,13 @@ Three rules fell out, and all three are quoted in source comments to this day:
 
 Spike C also predicted the crossover: ~0.50–0.53 ms of fixed overhead against a 3–7 GB/s CPU baseline gives a break-even at 1.5–3.7 MB. The final measured crossover was ≈4.3 MiB — slightly above the band because simdjson runs faster than 7 GB/s on small hot inputs on this machine, but the same mechanism, predicted before any kernel existed. The spike also noted that at the ≥100 MB design target, 0.5 ms is under 1% — noise. A considered-and-deferred option is recorded with it: merging two of the command buffers would save ~0.1–0.3 ms, worth nothing at the design target, so it never happened.
 
-## The output: a simdjson tape, deliberately
+## The output: a simdjson tape
 
 The parser's output is a *tape*: a flat array of 64-bit words plus a string buffer of unescaped string records. The layout is simdjson's tape layout, and the spec records why: "chosen deliberately so the M5 benchmark compares apples to apples: both parsers do the same amount of output work." No benchmark games where one parser materializes less than the other.
 
 Every tape word is one little-endian u64:
 
-```
+```c++
 bits 63..56   tag (ASCII byte)
 bits 55..0    payload (56 bits)
 
@@ -111,22 +110,21 @@ The tags are simdjson's own ASCII tape characters: `r` root, `{` `}` `[` `]` con
 
 The format spec pins a worked example, byte for byte, and a test fails if the doc and the code ever drift. For the 23-byte input `{"a":[1,2.5],"b":"x\n"}` the tape is exactly 13 words:
 
-```
-idx  word (hex)              tag  meaning
-0    7200_0000_0000_000C     r    final root word at index 12
-1    7B00_0002_0000_000C     {    end = 12 (one past } at 11), count = 2
-2    2200_0000_0000_0000     "    string buffer offset 0  -> key "a"
-3    5B00_0002_0000_0009     [    end = 9 (one past ] at 8), count = 2
-4    6C00_0000_0000_0000     l    i64 marker
-5    0000_0000_0000_0001     -    i64 bits of 1
-6    6400_0000_0000_0000     d    f64 marker
-7    4004_0000_0000_0000     -    f64 bits of 2.5
-8    5D00_0000_0000_0003     ]    matching [ at index 3
-9    2200_0000_0000_0006     "    offset 6  -> key "b"
-10   2200_0000_0000_000C     "    offset 12 -> value "x\n"
-11   7D00_0000_0000_0001     }    matching { at index 1
-12   7200_0000_0000_0000     r    points back at index 0
-```
+| idx | word (hex)              | tag | meaning                                     |
+|-----|-------------------------|-----|---------------------------------------------|
+| 0   | 7200_0000_0000_000C     | r   | final root word at index 12                 |
+| 1   | 7B00_0002_0000_000C     | {   | end = 12 (one past } at 11), count = 2      |
+| 2   | 2200_0000_0000_0000     | "   | string buffer offset 0  -> key "a"          |
+| 3   | 5B00_0002_0000_0009     | [   | end = 9 (one past ] at 8), count = 2        |
+| 4   | 6C00_0000_0000_0000     | l   | i64 marker                                  |
+| 5   | 0000_0000_0000_0001     | -   | i64 bits of 1                               |
+| 6   | 6400_0000_0000_0000     | d   | f64 marker                                  |
+| 7   | 4004_0000_0000_0000     | -   | f64 bits of 2.5                             |
+| 8   | 5D00_0000_0000_0003     | ]   | matching [ at index 3                       |
+| 9   | 2200_0000_0000_0006     | "   | offset 6  -> key "b"                        |
+| 10  | 2200_0000_0000_000C     | "   | offset 12 -> value "x\n"                    |
+| 11  | 7D00_0000_0000_0001     | }   | matching { at index 1                       |
+| 12  | 7200_0000_0000_0000     | r   | points back at index 0                      |
 
 Number typing mirrors simdjson exactly: an integer literal that fits i64 gets tag `l`; one in the u64-only range gets `u`; anything fractional, exponential, or out of integer range gets `d` with the correctly rounded double's bits. Integers beyond u64 become f64 — a real loss of precision, accepted for simdjson parity, and it resurfaces later as a serde limitation.
 
@@ -136,7 +134,7 @@ A string record in the buffer is `[u32 LE length][content bytes][NUL]`. The expl
 
 So the format pins a deviation: slots are allocated by **raw** input length.
 
-```
+```c
 raw_len(s)  = byte count between the quotes in the INPUT (escapes intact)
 slot(s)     = raw_len + 5            (4-byte length prefix + NUL)
 offset(s)   = exclusive prefix sum of slot, in document order
@@ -152,7 +150,7 @@ The whole format is locked across three artifacts — Rust constants, a Metal he
 
 The shipped pipeline is thirteen kernel families across four command buffers (the plan said three; a fourth appeared for a reason below). Each CPU sync exists to read back an exact size so the next allocation is exact-fit — never a guess proportional to input length. Kernel numbers are the design doc's names (they survive in the shader file names); the order shown is dispatch order.
 
-```
+```c++
 input bytes (page-aligned, space-padded to 64 B words, read in place)
    |
 CB1: K1  classify_escape_utf8   quote + candidate bitmaps (uint2),
@@ -196,7 +194,7 @@ x.y ^= 0u - (x.x >> 31);
 
 Then K3 computes tokens per word, bit-exactly matching the CPU reference:
 
-```
+```c++
 in_string = prefix_xor64(quote_real) ^ parity_carried_into_word
 tokens    = (candidates & ~in_string & ~quote_real) | quote_real
 ```
@@ -219,7 +217,7 @@ Now the observation that replaces the stack. Within one depth, the brackets of d
 
 Worked example, `[{"a":1},[2]]`:
 
-```
+```c++
 skeleton (doc order):   [   {   :   }   ,   [   ]   ]
 depth:                  1   2   2   2   1   2   2   1
 
@@ -287,7 +285,7 @@ The oracle is slow — 0.23–0.36 GB/s, some 7–15x slower than C++ simdjson (
 
 On top of the oracle:
 
-```
+```bash
 layer                          what it pins
 u2_selftest kernel             every uint2 helper vs in-kernel ulong oracle,
                                ~16k adversarial operand pairs, 15 named fail bits
@@ -336,26 +334,25 @@ The benchmark harness got as much paranoia as the parser. The specific fairness 
 
 The full sweep, in decimal GB/s (Rust simd-json and serde_json included as context):
 
-```
-dataset        size      metal-json  simdjson-cpp  simd-json-rs  serde_json
-twitter        0.6 MiB   0.491       3.960         2.783         0.697
-twitter_1m     1.0 MiB   1.042       3.200         2.135         0.514
-citm_catalog   1.6 MiB   1.901       4.362         3.245         1.101
-canada         2.1 MiB   2.179       1.539         1.212         0.753
-twitter_4m     4.0 MiB   2.924       3.030         2.158         0.538
-twitter_8m     8.0 MiB   4.294       3.210         2.227         0.508
-twitter_16m    16.0 MiB  4.961       2.738         2.056         0.526
-twitter_64m    64.0 MiB  6.413       2.814         2.048         0.556
-twitter_100m   100 MiB   6.400       3.105         2.051         0.536
-twitter_256m   256 MiB   7.129       3.261         2.206         0.548
-twitter_512m   512 MiB   7.514       2.772         2.162         0.566
-```
+| dataset        | size      | metal-json | simdjson-cpp | simd-json-rs | serde_json |
+|--------------- |-----------|------------|--------------|--------------|------------|
+| twitter        | 0.6 MiB   | 0.491      | 3.960        | 2.783        | 0.697      |
+| twitter_1m     | 1.0 MiB   | 1.042      | 3.200        | 2.135        | 0.514      |
+| citm_catalog   | 1.6 MiB   | 1.901      | 4.362        | 3.245        | 1.101      |
+| canada         | 2.1 MiB   | 2.179      | 1.539        | 1.212        | 0.753      |
+| twitter_4m     | 4.0 MiB   | 2.924      | 3.030        | 2.158        | 0.538      |
+| twitter_8m     | 8.0 MiB   | 4.294      | 3.210        | 2.227        | 0.508      |
+| twitter_16m    | 16.0 MiB  | 4.961      | 2.738        | 2.056        | 0.526      |
+| twitter_64m    | 64.0 MiB  | 6.413      | 2.814        | 2.048        | 0.556      |
+| twitter_100m   | 100 MiB   | 6.400      | 3.105        | 2.051        | 0.536      |
+| twitter_256m   | 256 MiB   | 7.129      | 3.261        | 2.206        | 0.548      |
+| twitter_512m   | 512 MiB   | 7.514      | 2.772        | 2.162        | 0.566      |
 
 The report states its own evidential limits in its third paragraph: every row at and above 1 MiB *of the twitter sweep* is a deterministic expansion of the twitter template, measured on this one M5 Max; the other shapes (citm_catalog at 1.6 MiB, canada at 2.1 MiB) were measured only at their canonical sizes; so the ≥100 MiB speedups read as "twitter-shaped documents on this machine," not a universal constant. (The expansion mechanics — records re-serialized by the Cargo.lock-pinned serde_json, cycled verbatim into one top-level JSON array, byte-identical across runs and machines, sha256-pinned — are documented in the report's Datasets section.) That scoping language was itself a review finding — the original headline claimed more than the sweep showed.
 
 Where the time goes on the 512 MiB parse (parse call only, no stats walk):
 
-```
+```bash
 phase                              wall ms   gpu ms   gap ms   % wall
 cb1 (K1-K4, bitmaps/tokens)         9.938    3.069    6.869    20.6%
 cb2 (K5-K7, scatter/validate)       8.880    8.681    0.199    18.4%
@@ -376,7 +373,7 @@ Getting here from milestone 4 was its own story: at M4 the parser delivered 2.12
 
 After the benchmarks I added a serde deserializer — the Rust idiom where a parser hands values to compile-time-generated visitor code for your concrete types. The design is small and the module doc states it plainly: "This module does not parse JSON text." It deserializes from the already-built tape:
 
-```
+```bash
 JSON bytes --GPU--> tape + unescaped strings --serde walk--> T
 ```
 
@@ -398,13 +395,12 @@ Then the second layer. The review-fix commit had fixed tuples to reject extra ar
 
 The architectural insight worth keeping: **static type information cannot reach the parse.** serde_json fuses parse and deserialize in one text pass, so knowing that a field is skipped can avoid work during parsing. Here the GPU builds the complete tape and unescaped string buffer for the whole document before any type-specific code runs — the parse is type-blind by construction, and `T`'s shape only accelerates the walk afterward. The benchmark shows what that costs at small sizes: on a deterministic ~4 MiB synthetic corpus (checksum-verified across all contenders; the PRNG seed spells "metal-js" in ASCII), end-to-end into typed structs on the M5 Max:
 
-```
-contender                    throughput
-serde_json borrowed          ~972 MiB/s
-serde_json owned             ~614 MiB/s
-metal-json borrowed (GPU)    ~384 MiB/s
-metal-json owned (GPU)       ~349 MiB/s
-```
+| Contender                  | Throughput   |
+|----------------------------|--------------|
+| serde_json borrowed        | ~972 MiB/s   |
+| serde_json owned           | ~614 MiB/s   |
+| metal-json borrowed (GPU)  | ~384 MiB/s   |
+| metal-json owned (GPU)     | ~349 MiB/s   |
 
 At 4 MiB, plain serde_json beats the GPU path about 2.5x end-to-end, like for like (borrowed vs borrowed; owned vs owned is about 1.8x). The PR description itself states no multiplier — just "at 4 MiB the GPU dispatch overhead dominates and serde_json wins end-to-end." It is the same curve as the main benchmark, told from the losing side; larger documents remain the design point. Note the deltas too: borrowing saves serde_json ~37% of its time but metal-json only ~9%, because metal-json's owned path only pays for `String` allocations during the walk — the parse is identical either way.
 
@@ -412,7 +408,7 @@ At 4 MiB, plain serde_json beats the GPU path about 2.5x end-to-end, like for li
 
 Every system is its compromises. Here are this one's, collected:
 
-```
+```bash
 compromise                         gave up                        got
 u32 token/tape indices             inputs > 4 GiB - 65 B          half the index traffic; 32-bit
                                                                   atomics on every Apple GPU
