@@ -57,6 +57,8 @@ pub mod gpu;
 pub mod metal;
 pub mod parser;
 pub mod pool;
+#[cfg(feature = "serde")]
+pub mod serde;
 pub mod stage;
 pub mod tape;
 pub mod value;
