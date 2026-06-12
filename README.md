@@ -3,7 +3,8 @@
 JSON parsing on the Apple Silicon GPU. metal-json parses standard JSON
 documents to a simdjson-equivalent typed tape — parsed `i64`/`u64`/`f64`
 numbers, validated + unescaped strings, full grammar validation — entirely
-through a Metal compute pipeline, and beats C++ simdjson on large inputs.
+through a Metal compute pipeline, and beats C++ simdjson on the large
+documents in our benchmark sweep.
 
 ## Results
 
@@ -21,14 +22,18 @@ v4.6.4 vendored, `-O3`). Full table, provenance, and methodology:
 | twitter_256m | 256 MiB   | 7.13            | 3.26                | **2.19×** |
 | twitter_512m | 512 MiB   | 7.51            | 2.77                | **2.71×** |
 
-**The claim this data supports:** on an M5 Max, metal-json parses ≥100 MB
-JSON documents **at least 2× faster** than C++ simdjson (DOM tape API) —
-2.0–2.7× across measured sessions, the spread being session noise rather
-than a trend — with every CPU-side cost of the hybrid pipeline (syncs,
-allocations, fixup passes) inside the timed region. Parse-only (without the
-stats walk both sides run), the 512 MiB parse sustains ~11–12 GB/s of wall
-throughput (the exact figure moves ~1 GB/s between sessions; see the
-breakdown in the report).
+**The claim this data supports:** metal-json is **2.1–2.7× faster** than
+C++ simdjson (DOM tape API) on large documents in our benchmark sweep —
+100–512 MiB inputs, twitter-shaped (deterministic expansions of the
+twitter template), measured on one Apple M5 Max — with every CPU-side cost
+of the hybrid pipeline (syncs, allocations, fixup passes) inside the timed
+region. Document shape matters: number-dense canada already favors
+metal-json at just 2.1 MiB (1.42×), while citm-style documents favor
+simdjson at the small sizes we measured — non-twitter shapes were only
+benchmarked at 0.6–2.1 MiB, and broader large-document shape coverage is
+future work. Parse-only (without the stats walk both sides run), the
+512 MiB parse sustains ~11–12 GB/s of wall throughput (the exact figure
+moves ~1 GB/s between sessions; see the breakdown in the report).
 
 **The crossover caveat:** the GPU pipeline pays a roughly fixed ~0.5–0.9 ms
 of dispatch/sync overhead per parse. On this machine the measured crossover
@@ -50,7 +55,7 @@ fn main() -> Result<(), metal_json::Error> {
     assert_eq!(root.get("name").unwrap().as_str(), Some("meow"));
     assert_eq!(root.get("tags").unwrap().at(1).unwrap().as_f64(), Some(2.5));
 
-    // Big files: mmap → MTLBuffer bytesNoCopy, guaranteed zero-copy input.
+    // Big files: read once, straight into a pooled page-aligned buffer.
     // let doc = parser.parse_file("big.json")?;
     Ok(())
 }
@@ -59,7 +64,11 @@ fn main() -> Result<(), metal_json::Error> {
 `Parser` is reusable (device, pipeline states, and a buffer pool are built
 once); `Document` is self-contained and returns its buffers to the pool on
 drop. For repeated parsing without input copies, fill a parser-provided
-page-aligned buffer (`AlignedInput`) and call `parse_aligned`.
+page-aligned buffer (`AlignedInput`) and call `parse_aligned`. Zero-copy
+*file* input exists as `unsafe fn parse_file_mmap` (mmap →
+`bytesNoCopy`): it is `unsafe` because the file must not be truncated or
+modified for the duration of the parse — truncating a mapped file can
+`SIGBUS` the process — which is exactly why the safe `parse_file` copies.
 
 ## What it parses
 

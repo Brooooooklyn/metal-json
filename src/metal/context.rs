@@ -28,6 +28,14 @@ impl MetalContext {
     /// shader library (embedded metallib, or runtime-compiled MSL when the
     /// `runtime-shaders` feature is enabled).
     pub fn new() -> Result<Self> {
+        // Honor the documented escape hatch before touching Metal at all:
+        // on GitHub's paravirtual macOS runners the backend shader compiler
+        // crashes nondeterministically while building our pipeline states
+        // (see examples/pso_probe.rs and the CI workflow), so CI disables
+        // the GPU explicitly rather than failing 89 tests mid-suite.
+        if std::env::var_os("METAL_JSON_DISABLE_GPU").is_some_and(|v| v == "1") {
+            return Err(Error::GpuDisabled);
+        }
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::NoDevice)?;
         let queue = device.newCommandQueue().ok_or(Error::NoCommandQueue)?;
         let library = load_library(&device)?;

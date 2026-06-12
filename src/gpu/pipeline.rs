@@ -76,15 +76,18 @@
 //!
 //! # M5 perf contract (the former correctness-first deviations, resolved)
 //!
-//! - **No zero fills.** The tape buffer is *not* zero-filled: on accepted
-//!   inputs every word is written by exactly one producer (containers/roots
-//!   by K12/K13 or the CPU root write, numbers/literals by K10, strings by
-//!   K11 — each token's footprint words belong to exactly one kernel), and
-//!   rejected runs never observe the tape. The string buffer is not
-//!   zero-filled either: gap bytes (escape-shrunk slots) are contractually
-//!   **unspecified** — with pooled buffers they are whatever the previous
-//!   parse left (the pinned gap policy; consumers compare records, never
-//!   raw gaps). The pool-poison tests in `tests/gpu_e2e.rs` pin both.
+//! - **No whole-buffer zero fills.** The tape buffer is *not* zero-filled:
+//!   on accepted inputs every word is written by exactly one producer
+//!   (containers/roots by K12/K13 or the CPU root write, numbers/literals
+//!   by K10, strings by K11 — each token's footprint words belong to
+//!   exactly one kernel), and rejected runs never observe the tape. The
+//!   string buffer is not pre-zeroed either: K11 (and the long-string CPU
+//!   valve) writes every record **and zero-fills each escape-shrunk slot's
+//!   gap tail**, so the cost is proportional to escape shrinkage, never
+//!   buffer size — gap bytes are deterministically zero on both backends
+//!   (they are reachable through `StringBuffer::as_bytes`, so pooled
+//!   previous-parse bytes must never survive there). The pool-poison tests
+//!   in `tests/gpu_e2e.rs` pin both with whole-buffer equality.
 //! - **No stage-1 snapshot.** `Stage2::run_to_lists` is lean: accepted runs
 //!   hand over live GPU buffers, rejected runs a packed verdict; the
 //!   test-runner `Vec` readbacks are rebuilt on demand outside this path.
@@ -100,7 +103,9 @@
 //!   counters below) — pooled contents are garbage by contract.
 //! - **Zero-copy input.** [`GpuInput::External`] wraps caller-held
 //!   page-aligned memory (`bytesNoCopy`); [`GpuInput::Bytes`] copies once
-//!   into a pooled buffer.
+//!   into a pooled buffer; [`GpuInput::Pooled`] hands over a pool buffer
+//!   the caller already filled (the `parse_file` read path — its one copy
+//!   happens file→buffer, with no intermediate allocation).
 
 use crate::error::{Error, Result, SyntaxErrorKind};
 use crate::metal::{Dispatch, GpuBuffer, MetalContext, MjParams, THREADGROUP_SIZE};
@@ -146,6 +151,18 @@ pub enum GpuInput<'a> {
         /// Document length in bytes.
         len: usize,
     },
+    /// A buffer checked out of **this parse's pool** that the caller
+    /// already filled with the document bytes plus the stage-1 padding
+    /// (bytes `len..len.next_multiple_of(64)` are ASCII spaces) — the
+    /// `Parser::parse_file` read-into-pool path. Unlike
+    /// [`External`](Self::External) it returns to the pool with the rest
+    /// of the stage-1 scratch.
+    Pooled {
+        /// The checked-out, filled, space-padded buffer.
+        buffer: GpuBuffer,
+        /// Document length in bytes.
+        len: usize,
+    },
 }
 
 /// Where a full GPU parse ended.
@@ -169,9 +186,9 @@ pub struct GpuParseOutput {
     pub tape: GpuBuffer,
     /// The string buffer (`[u32 LE len][content][NUL]` records at the
     /// raw-length prefix-sum offsets); `None` when the document has no
-    /// strings (`stringbuf_total == 0`). Gap bytes (escape-shrunk slots)
-    /// are contractually **unspecified** — with pooled buffers they are
-    /// whatever the previous parse left there.
+    /// strings (`stringbuf_total == 0`). Gap bytes (escape-shrunk slot
+    /// tails) are zero-filled by K11 / the long-string valve, so the whole
+    /// buffer is deterministic and byte-equal to the reference backend's.
     pub stringbuf: Option<GpuBuffer>,
     /// Token indices that took the K10 hard-case fixup path, sorted
     /// ascending (diagnostic; the value words are already patched).
@@ -274,6 +291,11 @@ impl GpuPipeline {
                 super::timing::record("stage1 alloc (zero-copy input)", t, 0.0);
                 bufs
             }
+            GpuInput::Pooled { buffer, len } => {
+                let bufs = Stage1Buffers::with_pooled_input(ctx, alloc, buffer, len)?;
+                super::timing::record("stage1 alloc (pooled input)", t, 0.0);
+                bufs
+            }
         };
 
         let result = self.drive(ctx, pool, &mut bufs1, max_depth);
@@ -359,10 +381,12 @@ impl GpuPipeline {
                 );
             }
             let chunks = string_total.div_ceil(THREADGROUP_SIZE);
-            // The string buffer, NOT zero-filled: K11 writes every record's
-            // `[u32 LE len][content][NUL]` bytes; gap bytes between records
-            // are contractually unspecified (the pinned gap policy — with a
-            // pool they are the previous parse's garbage).
+            // The string buffer, NOT pre-zeroed (pooled contents are
+            // garbage by contract): K11 writes every record's
+            // `[u32 LE len][content][NUL]` bytes AND zero-fills each
+            // escape-shrunk slot's gap tail (the pinned gap policy), so
+            // every reachable byte of an accepted parse is written —
+            // without an O(buffer) memset.
             let stringbuf = alloc.buffer(ctx, stringbuf_total)?;
             // The long-string append counter gets its precondition
             // established explicitly (pooled contents are garbage), like
@@ -768,7 +792,8 @@ mod tests {
         assert_eq!(&bytes[6..12], &[1, 0, 0, 0, b'b', 0]);
         assert_eq!(&bytes[12..19], &[2, 0, 0, 0, b'x', 0x0A, 0]);
         // bytes[19] is the gap byte the `\n` escape shrank away —
-        // contractually unspecified (the pinned gap policy), NOT compared.
+        // zero-filled by K11's careful path (the pinned gap policy).
+        assert_eq!(bytes[19], 0);
         assert!(out.fixup_tokens.is_empty());
     }
 

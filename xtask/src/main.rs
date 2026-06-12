@@ -670,6 +670,21 @@ fn render_report(datasets: &DatasetRows, breakdown: Option<&str>) -> String {
             format_ms(big.sj_ns),
             crossover.map_or("a few MiB".to_owned(), |b| human_size(b as u64)),
         );
+        // The generalization boundary of the headline, stated explicitly:
+        // the large-input rows are all one document shape on one machine.
+        out.push_str(
+            "**Scope of evidence:** every row at and above 1 MiB of the \
+             twitter sweep — including all ≥100 MiB rows — is a \
+             deterministic expansion of the *twitter template* measured on \
+             this one machine; the other document shapes (citm_catalog, \
+             canada) were measured only at their canonical 1.6–2.1 MiB \
+             sizes. Shape already matters at those sizes (number-dense \
+             canada favors metal-json at 2.1 MiB, citm_catalog favors \
+             simdjson), so the ≥100 MiB speedups should be read as \
+             \"twitter-shaped documents on this machine\", not as a \
+             universal large-input constant; large-size coverage of other \
+             shapes is future work.\n\n",
+        );
     }
 
     // Environment.

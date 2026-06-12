@@ -20,10 +20,9 @@
 //!    `tests/numbers.rs`) bit-exact through the GPU backend, plus
 //!    fixup-path literals embedded inside full documents.
 //! 4. **Whole-tape bit-exactness**: for every accepted corpus + `y_` file
-//!    the GPU tape words equal the reference tape words AND every string
-//!    record (`[u32 LE len][content][NUL]`) is byte-equal at its tape
-//!    offset — gap bytes excluded per the pinned policy in
-//!    `docs/tape-format.md`.
+//!    the GPU tape words equal the reference tape words AND the whole
+//!    string buffer is byte-equal — records and zero-filled gap bytes
+//!    alike (the pinned policy in `docs/tape-format.md`).
 //! 5. **Property tests**: random documents (tape-exact), raw byte soup
 //!    (verdict parity, never panic), escape-dense documents (tape-exact +
 //!    serde agreement).
@@ -46,10 +45,11 @@ fn file_name(path: &Path) -> &str {
 
 /// Whole-artifact equality, the apples-to-apples contract of
 /// `docs/tape-format.md`: tape words bit-identical (string offsets
-/// included — the raw-length prefix-sum allocation makes them equal), and
-/// at every `"` word's offset the full `[u32 LE len][content][NUL]` record
-/// byte-equal. Bytes BETWEEN records (gaps) are unspecified on the GPU and
-/// never compared. Returns the number of string records compared.
+/// included — the raw-length prefix-sum allocation makes them equal), the
+/// **whole string buffer byte-equal** (gap bytes are zero-filled on both
+/// backends, so even the slack of escape-shrunk slots must match), and at
+/// every `"` word's offset a well-formed `[u32 LE len][content][NUL]`
+/// record. Returns the number of string records compared.
 fn assert_tape_and_records_eq(gpu: &Document, cpu: &Document, label: &str) -> usize {
     assert_raw_tape_and_records_eq(gpu.tape(), gpu.strings().as_bytes(), cpu, label)
 }
@@ -73,6 +73,13 @@ fn assert_raw_tape_and_records_eq(
         gpu_bytes.len(),
         cpu_bytes.len(),
         "{label}: string buffer size (raw-length prefix-sum total)"
+    );
+    // THE whole-buffer pin: gap bytes are zero-filled on both backends
+    // (docs/tape-format.md), so the raw buffers — records AND gaps — must
+    // be byte-identical, not merely record-equal.
+    assert_eq!(
+        gpu_bytes, cpu_bytes,
+        "{label}: whole string buffer must be byte-identical (gaps included)"
     );
     let mut records = 0usize;
     let tape = gpu_tape;
@@ -117,6 +124,54 @@ fn assert_raw_tape_and_records_eq(
         i += 1;
     }
     records
+}
+
+/// Assert every byte of `bytes` NOT covered by a record reachable from a
+/// `"` tape word reads back **zero** — the slot gaps escape-shrunk records
+/// leave. Independent of the reference backend on purpose: the poison test
+/// uses it to prove a pooled buffer's previous contents (0xDB) never
+/// survive into the reachable gap bytes of an accepted parse. Returns the
+/// number of gap bytes checked.
+fn assert_string_gaps_zero(tape: &[u64], bytes: &[u8], label: &str) -> usize {
+    // Collect each record's [start, end-of-NUL) extent off the tape.
+    let mut records: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < tape.len() {
+        let word = tape[i];
+        if matches!(tag(word), TAG_INT64 | TAG_UINT64 | TAG_DOUBLE) {
+            i += 2; // skip the raw value word (any bit pattern)
+            continue;
+        }
+        if tag(word) == TAG_STRING {
+            let offset = usize::try_from(string_offset(word)).expect("offset fits usize");
+            let header: [u8; STRING_RECORD_HEADER_BYTES] = bytes
+                [offset..offset + STRING_RECORD_HEADER_BYTES]
+                .try_into()
+                .expect("4 header bytes");
+            let len = u32::from_le_bytes(header) as usize;
+            records.push((offset, offset + STRING_RECORD_HEADER_BYTES + len + 1));
+        }
+        i += 1;
+    }
+    // Slots are allocated back-to-back in document order, so sorting by
+    // start offset makes every uncovered range a slot-tail gap.
+    records.sort_unstable();
+    let mut gap_bytes = 0usize;
+    let mut cursor = 0usize;
+    for &(start, end) in &records {
+        assert!(
+            bytes[cursor..start].iter().all(|&b| b == 0),
+            "{label}: gap bytes {cursor}..{start} must read back zero"
+        );
+        gap_bytes += start - cursor;
+        cursor = end;
+    }
+    assert!(
+        bytes[cursor..].iter().all(|&b| b == 0),
+        "{label}: trailing gap bytes {cursor}..{} must read back zero",
+        bytes.len()
+    );
+    gap_bytes + (bytes.len() - cursor)
 }
 
 /// Both backends on one input: same verdict; on acceptance the
@@ -415,9 +470,9 @@ fn fixup_path_numbers_inside_documents_are_bit_exact() {
 // --- 4. Whole-tape bit-exactness ---------------------------------------------------
 
 /// THE apples-to-apples artifact: for every accepted corpus + `y_` file,
-/// the GPU tape words equal the reference tape words bit-for-bit AND every
-/// string record is byte-equal at its tape offset (gap bytes excluded per
-/// the pinned policy in docs/tape-format.md).
+/// the GPU tape words equal the reference tape words bit-for-bit AND the
+/// whole string buffer is byte-equal — records and zero-filled gaps alike
+/// (the pinned policy in docs/tape-format.md).
 #[test]
 fn whole_tape_bit_exact_on_corpus_and_y_files() {
     let Some(gpu) = common::gpu_parser_or_skip("whole_tape_bit_exact_on_corpus_and_y_files")
@@ -876,12 +931,14 @@ mod long_strings {
 // --- 6b. M5: pool reuse, poison, zero-copy input -----------------------------------
 
 /// The M5 structural-overhead work changed three contracts this module
-/// pins: (a) pooled buffers are reused **without** zero fills — a parse
-/// must be bit-exact over arbitrary garbage (poison) in every checked-out
-/// buffer; (b) `Document`s read the shared GPU buffers zero-copy and own
-/// them until drop (on any thread, parser dead or alive); (c) the
-/// zero-copy input paths (`parse_aligned`, mmap `parse_file`) are
-/// verdict- and tape-equal to the copied path on every seam shape.
+/// pins: (a) pooled buffers are reused **without** whole-buffer zero
+/// fills — a parse must be bit-exact over arbitrary garbage (poison) in
+/// every checked-out buffer, with reachable slot gaps zero-filled by the
+/// producers; (b) `Document`s read the shared GPU buffers zero-copy and
+/// own them until drop (on any thread, parser dead or alive); (c) the
+/// file/aligned input paths (`parse_file` read-into-pool, `parse_aligned`
+/// bytesNoCopy, unsafe `parse_file_mmap`) are verdict- and tape-equal to
+/// the copied path on every seam shape.
 mod m5_reuse_and_zero_copy {
     use std::io::Write;
 
@@ -939,10 +996,13 @@ mod m5_reuse_and_zero_copy {
 
     /// THE poison test: one shared pool across the whole corpus + fixture
     /// sweep, free buffers filled with 0xDB before every parse. Bit-exact
-    /// tapes and records (and identical verdicts on rejects) prove no
-    /// kernel or CPU step reads a byte it did not write — the contract
-    /// that let the M5 work drop the tape/stringbuf zero fills and pool
-    /// buffers without resets.
+    /// tapes and **whole string buffers** (and identical verdicts on
+    /// rejects) prove no kernel or CPU step reads a byte it did not write
+    /// AND that every reachable byte of an accepted parse — slot gaps
+    /// included — is written: the 0xDB poison must never survive into
+    /// gap bytes (asserted explicitly, independent of the reference).
+    /// This is the contract that let the M5 work drop the whole-buffer
+    /// tape/stringbuf zero fills and pool buffers without resets.
     #[test]
     fn pooled_parses_over_poisoned_buffers_are_bit_exact() {
         let Some((ctx, pipeline)) =
@@ -979,6 +1039,14 @@ mod m5_reuse_and_zero_copy {
                             out.tape.as_slice::<u64>(),
                             strings,
                             &cpu_doc,
+                            &label,
+                        );
+                        // Poison must not survive into reachable gap bytes
+                        // (asserted off the GPU artifacts alone, on top of
+                        // the whole-buffer reference equality above).
+                        super::assert_string_gaps_zero(
+                            out.tape.as_slice::<u64>(),
+                            strings,
                             &label,
                         );
                         // Hand the document buffers back so the next parse
@@ -1093,10 +1161,11 @@ mod m5_reuse_and_zero_copy {
         }
     }
 
-    /// mmap-backed `parse_file` (zero-copy, COW tail padding) matches
+    /// `parse_file` (the safe read-into-pooled-buffer path) matches
     /// `parse` on every corpus file plus the tail edge cases: a document
-    /// of exactly one page (no tail to pad) and a truncated UTF-8 sequence
-    /// at EOF (the COW space padding must keep the reference offset).
+    /// of exactly one page (no tail to pad), a 64-multiple length, a
+    /// truncated UTF-8 sequence at EOF (the space padding must keep the
+    /// reference offset), empty, and a trailing root scalar at EOF.
     #[test]
     fn parse_file_matches_parse_on_corpus_and_edges() {
         let Some(gpu) = common::gpu_parser_or_skip("parse_file_matches_parse_on_corpus_and_edges")
@@ -1115,7 +1184,7 @@ mod m5_reuse_and_zero_copy {
             common::assert_docs_eq(from_file.root(), from_bytes.root(), &label);
         }
 
-        // Edge files in a temp dir: exact-page length (no COW tail), a
+        // Edge files in a temp dir: exact-page length (no tail to pad), a
         // 64-multiple length, truncated UTF-8 at EOF, and empty.
         let dir = std::env::temp_dir().join(format!("metal-json-m5-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -1149,6 +1218,65 @@ mod m5_reuse_and_zero_copy {
                     "{name}: verdicts diverge — file {:?} vs bytes {:?}",
                     a.map(|d| d.tape().len()),
                     b.map(|d| d.tape().len())
+                ),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The unsafe mmap variant, `parse_file_mmap` (zero-copy, COW tail
+    /// padding): tape- and verdict-equal to both `parse_file` and `parse`
+    /// on temp files covering the same tail edge cases. The temp files are
+    /// private to this test, so the # Safety contract (no concurrent
+    /// truncation/modification) holds trivially.
+    #[test]
+    fn parse_file_mmap_matches_parse_file_on_edges() {
+        let Some(gpu) = common::gpu_parser_or_skip("parse_file_mmap_matches_parse_file_on_edges")
+        else {
+            return;
+        };
+
+        let dir =
+            std::env::temp_dir().join(format!("metal-json-m5-mmap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut page_doc = br#"{"k":"v"}"#.to_vec();
+        page_doc.resize(16384, b' ');
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("worked.json", br#"{"a":[1,2.5],"b":"x\n"}"#.to_vec()),
+            ("page.json", page_doc),
+            ("trunc-utf8.json", b"[\"a\xC3".to_vec()),
+            ("empty.json", Vec::new()),
+            ("scalar.json", b"12345".to_vec()),
+            ("reject.json", br#"["\q"]"#.to_vec()),
+        ];
+        for (name, bytes) in &cases {
+            let path = dir.join(name);
+            let mut f = std::fs::File::create(&path).expect("temp file");
+            f.write_all(bytes).expect("write temp file");
+            drop(f);
+            // SAFETY: the file is private to this test and not touched
+            // again until the call returns.
+            let mmap_result = unsafe { gpu.parse_file_mmap(&path) };
+            match (mmap_result, gpu.parse_file(&path), gpu.parse(bytes)) {
+                (Ok(m), Ok(f), Ok(b)) => {
+                    assert_eq!(m.tape(), b.tape(), "{name}: tape (mmap vs bytes)");
+                    assert_eq!(m.tape(), f.tape(), "{name}: tape (mmap vs parse_file)");
+                    assert_eq!(
+                        m.strings().as_bytes(),
+                        b.strings().as_bytes(),
+                        "{name}: string buffer (mmap vs bytes)"
+                    );
+                    common::assert_docs_eq(m.root(), b.root(), name);
+                }
+                (Err(m), Err(f), Err(b)) => {
+                    assert_eq!(format!("{m:?}"), format!("{b:?}"), "{name}: mmap vs bytes");
+                    assert_eq!(format!("{m:?}"), format!("{f:?}"), "{name}: mmap vs file");
+                }
+                (m, f, b) => panic!(
+                    "{name}: verdicts diverge — mmap ok={}, parse_file ok={}, bytes ok={}",
+                    m.is_ok(),
+                    f.is_ok(),
+                    b.is_ok()
                 ),
             }
         }

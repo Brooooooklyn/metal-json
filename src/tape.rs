@@ -507,8 +507,10 @@ impl std::fmt::Debug for TapeBuffer {
 ///   [`pad_to`](Self::pad_to) place records at offsets allocated by the
 ///   pipeline's raw-length prefix sum (see `docs/tape-format.md`), where
 ///   escapes that shrink a string leave a **gap** before the next record.
-///   The reference backend zero-fills gaps deterministically; on the GPU
-///   backend gap bytes are contractually unspecified.
+///   Gap bytes are zero-filled on **both** backends (the reference as it
+///   emits, the GPU kernels/valve as they finish each shrunk record), so
+///   the buffer contents are deterministic — and a pooled GPU buffer can
+///   never leak a previous parse's bytes through them.
 ///
 /// Like [`TapeBuffer`], the backing store is either a `Vec<u8>` (the
 /// reference builder; the record-appending mutators are `Vec`-backed only
@@ -681,10 +683,12 @@ impl StringBuffer {
         self.bytes().is_empty()
     }
 
-    /// Raw buffer contents: records in document order. Gap bytes (where the
-    /// offset scheme left room) are zero-filled on the reference backend
-    /// and **unspecified** on the GPU backend — compare records (see
-    /// [`record_bytes`](Self::record_bytes)), never raw gaps.
+    /// Raw buffer contents: records in document order. Gap bytes (where
+    /// the offset scheme left room after an escape-shrunk record) are
+    /// **zero-filled on both backends**, so the returned slice is fully
+    /// deterministic — equal documents produce byte-equal buffers
+    /// regardless of backend or buffer reuse, and no byte of a previous
+    /// parse is ever visible here.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes()

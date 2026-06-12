@@ -14,8 +14,10 @@
 //! When an escape shrank a string, the slack before the next slot (and
 //! after the last record) is a **gap**: the reference zero-fills every gap
 //! byte so its output is deterministic, the total buffer size being the
-//! full `Σ (raw_len + 5)`. GPU gap bytes are unspecified; kernel diff
-//! tests compare per-record bytes + tape offsets only.
+//! full `Σ (raw_len + 5)`. The GPU backend zero-fills the same gaps
+//! (K11's careful path / the long-string valve), so the two backends'
+//! string buffers are byte-identical and the differential tests compare
+//! them whole.
 
 use super::scalars::{ParsedScalar, ScalarValue};
 use super::strings::UnescapedString;

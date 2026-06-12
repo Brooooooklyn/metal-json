@@ -4,6 +4,8 @@ Parse-to-tape throughput: metal-json (GPU) vs C++ simdjson (vendored, FFI) vs Ru
 
 **Headline:** on this machine metal-json parses the twitter_512m (512.0 MiB) document **2.71× faster** than C++ simdjson (71.447 ms vs 193.711 ms). The win holds across the ≥100 MiB sweep below. **Crossover caveat:** below 4.3 MiB of input, simdjson wins — the GPU pipeline carries a fixed dispatch/sync overhead that small documents cannot amortize.
 
+**Scope of evidence:** every row at and above 1 MiB of the twitter sweep — including all ≥100 MiB rows — is a deterministic expansion of the *twitter template* measured on this one M5 Max; the other document shapes (citm_catalog, canada) were measured only at their canonical 1.6–2.1 MiB sizes. Shape already matters at those sizes (number-dense canada favors metal-json at 2.1 MiB, citm_catalog favors simdjson), so the ≥100 MiB speedups should be read as "twitter-shaped documents on this machine", not as a universal large-input constant; large-size coverage of other shapes is future work.
+
 ## Environment
 
 - **Date**: 2026-06-12

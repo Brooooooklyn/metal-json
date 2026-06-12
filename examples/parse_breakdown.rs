@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo run --release --features timing --example parse_breakdown -- \
-//!     data/bench/twitter_512m.json [iters] [copy|aligned|file]
+//!     data/bench/twitter_512m.json [iters] [copy|aligned|file|mmap]
 //! ```
 //!
 //! Parses the file `iters` times (default 9, after 3 warmups) on the GPU
@@ -16,8 +16,10 @@
 //!
 //! The third argument selects the input path: `copy` (default —
 //! `Parser::parse`, one memcpy into a pooled buffer), `aligned`
-//! (`Parser::parse_aligned`, zero copy) or `file` (`Parser::parse_file`,
-//! mmap zero copy).
+//! (`Parser::parse_aligned`, zero copy), `file` (`Parser::parse_file`,
+//! one read straight into a pooled buffer) or `mmap` (the unsafe
+//! `Parser::parse_file_mmap`, mmap zero copy — sound here because nothing
+//! modifies the benchmark file mid-run).
 
 use std::time::Instant;
 
@@ -52,8 +54,11 @@ fn main() {
             "copy" => parser.parse(&bytes).expect("parse failed"),
             "aligned" => parser.parse_aligned(&aligned).expect("parse_aligned failed"),
             "file" => parser.parse_file(&path).expect("parse_file failed"),
+            // SAFETY: the benchmark input file is not modified while this
+            // example runs (the caller's contract for the mmap path).
+            "mmap" => unsafe { parser.parse_file_mmap(&path) }.expect("parse_file_mmap failed"),
             other => {
-                eprintln!("unknown mode {other:?} (want copy|aligned|file)");
+                eprintln!("unknown mode {other:?} (want copy|aligned|file|mmap)");
                 std::process::exit(2);
             }
         }

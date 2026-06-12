@@ -115,13 +115,18 @@ Unescaped content is always ≤ raw content, so a record whose escapes
 shrank it does not fill its slot: the bytes between its NUL and the next
 slot (or the buffer end, for the last string) are a **gap**.
 
-- Gap bytes are **unspecified** in GPU output; consumers must only ever
-  read through the offsets stored on the tape.
-- The CPU reference backend **zero-fills** every gap byte, so its output
-  is deterministic.
-- GPU-vs-reference diff tests therefore compare the tape words (including
-  string offsets) and the per-record bytes (`[length][content][NUL]` at
-  each tape offset) — never raw gap bytes.
+- Gap bytes are **zero-filled on both backends**: the CPU reference
+  zero-fills as it emits, and the GPU string kernel (plus the long-string
+  CPU valve) zero-fills each shrunk record's slot tail as it finishes the
+  record. The cost is proportional to actual escape shrinkage, never to
+  buffer size — there is no whole-buffer memset.
+- This is a hard requirement, not a convenience: GPU buffers come from a
+  reuse pool without zeroing, and the whole buffer (gaps included) is
+  reachable through the safe `StringBuffer::as_bytes` API — unspecified
+  gaps would leak bytes of a previously parsed document.
+- Equal documents therefore produce **byte-identical string buffers** on
+  both backends; the differential tests compare whole buffers, and
+  consumers still normally read through the offsets stored on the tape.
 
 ## Numbers
 
@@ -157,7 +162,7 @@ String slot allocation (raw-length prefix sum):
 
 Buffer size = 6 + 6 + 8 = **20 bytes**. The last record unescapes to 2
 content bytes, so it occupies only 7 of its 8 slot bytes — its slot ends
-with 1 gap byte (zero-filled by the reference backend).
+with 1 gap byte (zero-filled on both backends).
 
 ### Tape (13 words)
 
@@ -191,7 +196,7 @@ with 1 gap byte (zero-filled by the reference backend).
 | 16 | `78` | `x` |
 | 17 | `0A` | line feed — the `\n` escape, resolved |
 | 18 | `00` | NUL |
-| 19 | `00` | gap (slot is 8 bytes, record used 7; zero in the reference, unspecified on the GPU) |
+| 19 | `00` | gap (slot is 8 bytes, record used 7; zero-filled on both backends) |
 
 ## Notes / deviations
 

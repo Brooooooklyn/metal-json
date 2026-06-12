@@ -62,8 +62,13 @@
 // `raw_len + 5` slot (unescaped output is never longer than raw input, the
 // reference's `bytes.len() <= raw.len()` invariant), and the tape word
 // lands at tape_ofs[token] < the tape length passed in reserved0 (checked
-// defensively). Gap bytes between a shrunk record's NUL and the next slot
-// are left UNSPECIFIED (never written) per the pinned gap policy.
+// defensively). Gap bytes between a shrunk record's NUL and the end of its
+// slot are ZERO-FILLED by the careful path's epilogue (reference parity):
+// the string buffer is pooled and not pre-zeroed, and an accepted
+// Document exposes the raw buffer through safe APIs, so a previous
+// parse's bytes must never survive in reachable gaps. Clean strings have
+// no gap (unescaped == raw), so the zeroing costs O(escape shrinkage),
+// never O(buffer).
 
 #include "common.h"
 #include "tape_types.h"
@@ -223,12 +228,14 @@ static inline int mj_str_hex4(device const uchar* raw, ulong at, ulong raw_len) 
 }
 
 // Validate + unescape string-list entry `s`. On success writes the
-// [u32 LE len][content][NUL] record at record_offsets[s] and the string
-// tape word at tape_ofs[token], and returns MJ_HEADER_NO_ERROR; on the
-// string's first (leftmost) error returns the packed error word and
-// guarantees nothing about the record bytes (rejected outputs are never
-// read — the rejection contract). Mirrors reference `unescape` plus the
-// record/tape emission of `emit_tape`.
+// [u32 LE len][content][NUL] record at record_offsets[s], zero-fills the
+// rest of the record's `raw_len + 5` slot (the gap an escape-shrunk
+// string leaves — reference parity over pooled, non-zeroed buffers) and
+// writes the string tape word at tape_ofs[token], returning
+// MJ_HEADER_NO_ERROR; on the string's first (leftmost) error returns the
+// packed error word and guarantees nothing about the record bytes
+// (rejected outputs are never read — the rejection contract). Mirrors
+// reference `unescape` plus the record/tape emission of `emit_tape`.
 static inline uint64_t mj_str_unescape_one(
     device const uchar* input,
     device const uint* tok_pos,
@@ -406,6 +413,16 @@ static inline uint64_t mj_str_unescape_one(
     stringbuf[rec + 2] = uchar((len >> 16) & 0xFFu);
     stringbuf[rec + 3] = uchar((len >> 24) & 0xFFu);
     dst[o] = uchar(0);
+    // Zero the gap up to the end of this record's `raw_len + 5` slot
+    // (its content+NUL area is dst[0 .. raw_len + 1)): escapes only
+    // shrink, so o <= raw_len and the loop runs raw_len - o times —
+    // proportional to the shrinkage, nothing for clean strings. Pooled
+    // string buffers are not pre-zeroed; without this, gap bytes would
+    // leak a previous parse's contents through the Document's safe
+    // raw-buffer accessors (reference backends zero-fill the same gaps).
+    for (ulong g = o + 1; g <= raw_len; ++g) {
+        dst[g] = uchar(0);
+    }
 
     // The string tape word at this token's tape position.
     ulong pos = ulong(tape_ofs[t]);
@@ -461,10 +478,11 @@ static inline void mj_str_finish_record(
 //            such string at a time, 32 consecutive bytes per step —
 //            coalesced loads/stores, zero divergence;
 //   phase 3  strings whose scan hit a backslash or control byte rerun
-//            through mj_str_unescape_one UNCHANGED (its leftmost-error
-//            verdicts and record bytes are the pinned semantics; the
-//            phase-1/2 prefix writes it overwrites — or strands as gap
-//            bytes, which are contractually unspecified).
+//            through mj_str_unescape_one (its leftmost-error verdicts and
+//            record bytes are the pinned semantics; the phase-1/2 prefix
+//            writes it overwrites — and its epilogue zero-fills the slot
+//            gap, erasing any stranded prefix bytes along with the pooled
+//            buffer's previous contents).
 //
 // Every phase-1/2 write stays inside the string's own record content area
 // (`dst[idx]`, idx < raw_len < slot), so the eager copy can never touch a

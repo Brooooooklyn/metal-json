@@ -40,6 +40,16 @@ pub enum Error {
     #[error("no Metal GPU device available (MTLCreateSystemDefaultDevice returned nil)")]
     NoDevice,
 
+    /// The GPU was explicitly disabled via `METAL_JSON_DISABLE_GPU=1`.
+    ///
+    /// Escape hatch for environments whose Metal stack cannot run the
+    /// pipeline — e.g. paravirtualized CI runners whose backend shader
+    /// compiler crashes nondeterministically on real compute kernels.
+    /// Everything that probes for a device (backend selection, test
+    /// gating) treats this exactly like a missing device.
+    #[error("Metal GPU disabled via METAL_JSON_DISABLE_GPU=1")]
+    GpuDisabled,
+
     /// The Metal device refused to create a command queue.
     #[error("failed to create a Metal command queue")]
     NoCommandQueue,

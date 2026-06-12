@@ -388,6 +388,28 @@ impl Stage1Buffers {
         Self::assemble(ctx, alloc, input_buf, input_len, true)
     }
 
+    /// Build the stage-1 set around a **pool-checked-out** input buffer the
+    /// caller already filled — `Parser::parse_file`'s read-into-pool path:
+    /// the document bytes occupy `input_buf[..input_len]` and the tail up
+    /// to the next 64-byte word boundary is ASCII spaces (the same padding
+    /// invariant [`new`](Self::new) writes). Unlike
+    /// [`with_external_input`](Self::with_external_input) the buffer is
+    /// pool-eligible: [`recycle`](Self::recycle) returns it with the rest
+    /// of the stage-1 scratch.
+    pub(crate) fn with_pooled_input(
+        ctx: &MetalContext,
+        alloc: Alloc<'_>,
+        input_buf: GpuBuffer,
+        input_len: usize,
+    ) -> Result<Self> {
+        check_input_len(input_len as u64)?;
+        debug_assert!(
+            input_buf.len() >= input_len.next_multiple_of(WORD_BYTES),
+            "pooled input buffer must cover the padded word length"
+        );
+        Self::assemble(ctx, alloc, input_buf, input_len, false)
+    }
+
     fn assemble(
         ctx: &MetalContext,
         alloc: Alloc<'_>,

@@ -40,22 +40,25 @@
 //! `stage6_strings(tokens, input)`. The production composition,
 //! [`crate::gpu::pipeline::GpuPipeline`], encodes the same dispatches into
 //! the full pipeline's CB3 next to K10 and the structure kernels; nothing
-//! differs beyond where the dispatches are encoded (and that the pipeline
-//! zero-fills the string buffer instead of poisoning it — gap bytes stay
-//! contractually unspecified either way).
+//! differs beyond where the dispatches are encoded (the pipeline's string
+//! buffer comes from the pool un-zeroed; this runner poisons its fresh
+//! allocation instead — both rely on K11 writing every reachable byte).
 //!
 //! # The pinned gap policy (and why the runner poisons the string buffer)
 //!
 //! Record offsets are allocated by RAW length (`raw_len + 5` slots), so a
 //! record whose escapes shrank it leaves a gap before the next slot. Gap
-//! bytes are **unspecified** in GPU output (the kernel never writes them);
-//! tests therefore compare tape words and per-record bytes
-//! (`[u32 LE len][content][NUL]` at each offset) — never raw gap bytes.
-//! To keep that contract honest, this runner pre-fills the string buffer
-//! with a poison byte: a kernel that forgot to write a length byte, a
-//! content byte or the NUL shows up as poison instead of being masked by
-//! conveniently-zero fresh pages. (The CPU reference zero-fills gaps
-//! instead — its output is deterministic by design.)
+//! bytes are **zero-filled** on both backends: the reference zero-fills as
+//! it emits, and K11's careful path (plus the [`patch_long_strings`] CPU
+//! valve) zero-fills each shrunk record's slot tail — over pooled,
+//! non-zeroed buffers anything else would leak a previous parse's bytes
+//! through the `Document`'s safe raw-buffer accessors
+//! (`StringBuffer::as_bytes`). Whole-buffer GPU-vs-reference equality is
+//! therefore well-defined and pinned in `tests/gpu_e2e.rs`.
+//! To keep the "every reachable byte is written" contract honest, this
+//! runner pre-fills the string buffer with a poison byte: a kernel that
+//! forgot a length byte, a content byte, the NUL **or a gap byte** shows
+//! up as poison instead of being masked by conveniently-zero fresh pages.
 //!
 //! # The long-string valve (the K10 fixup pattern, applied to K11)
 //!
@@ -120,9 +123,10 @@ pub const ERR_STRING_CONTROL: u32 = 24;
 /// (a test parses the shader and pins both).
 pub const LONG_STRING_THRESHOLD: u32 = 16384;
 
-/// Pre-fill byte for the GPU string buffer (see the module docs: gap bytes
-/// are unspecified, and poison keeps "kernel forgot to write" failures
-/// from hiding behind zeroed fresh pages).
+/// Pre-fill byte for the GPU string buffer (see the module docs: K11 must
+/// write every reachable byte — records AND zero-filled gaps — and poison
+/// keeps "kernel forgot to write" failures from hiding behind
+/// conveniently-zero fresh pages).
 const STRINGBUF_POISON: u8 = 0xA5;
 
 /// Everything the standalone K11 runner produces, copied back into plain
@@ -151,9 +155,9 @@ pub struct StringsOutput {
     /// reference `UnescapedString::record_offset`.
     pub record_offsets: Vec<u64>,
     /// The string buffer: a `[u32 LE len][content][NUL]` record at every
-    /// offset in [`record_offsets`](Self::record_offsets). Gap bytes are
-    /// UNSPECIFIED (this runner poisons them with `0xA5`); read records
-    /// only through the offsets.
+    /// offset in [`record_offsets`](Self::record_offsets), gap bytes
+    /// (escape-shrunk slot tails) zero-filled by the kernel/patch — the
+    /// runner's `0xA5` poison pre-fill must never survive into it.
     pub stringbuf: Vec<u8>,
     /// The tape, `tape_word_total + 2` words: `"` words written by K11 at
     /// `tape_ofs[token]` for every string token, zero-word holes
@@ -477,8 +481,10 @@ pub fn run_strings(ctx: &MetalContext, input: &[u8]) -> Result<StringsOutput> {
 /// number-fixup value-word patches. Record offsets were computed by
 /// `string_record_offsets` from token positions alone, so CPU-written
 /// records compose exactly with GPU-written neighbors (the pinned
-/// raw-length allocation; gap bytes in oversized slots stay unwritten,
-/// per the gap policy).
+/// raw-length allocation); the gap an escape-shrunk record leaves in its
+/// oversized slot is zero-filled here, exactly like K11's careful path
+/// (the gap policy: pooled buffers are not pre-zeroed, and gaps are
+/// reachable through the `Document`'s safe raw-buffer accessors).
 ///
 /// Returns the earliest packed `(offset << 32) | code` among flagged
 /// strings that reject ([`ERR_STRING_ESCAPE`] at the backslash,
@@ -524,6 +530,13 @@ pub fn patch_long_strings(
                 let content = rec + STRING_RECORD_HEADER_BYTES;
                 stringbuf[content..content + bytes.len()].copy_from_slice(&bytes);
                 stringbuf[content + bytes.len()] = 0;
+                // Zero the gap up to the end of the `raw_len + 5` slot (the
+                // K11 careful-path epilogue, mirrored): the string buffer is
+                // pooled and not pre-zeroed, and an escape-shrunk record
+                // must not leave a previous parse's bytes reachable through
+                // the Document's safe raw-buffer accessors. Empty when the
+                // string had no shrinking escapes (bytes.len() == raw.len()).
+                stringbuf[content + bytes.len() + 1..content + raw.len() + 1].fill(0);
                 tape[tape_ofs[t] as usize] = make_string(record_offsets[s as usize]);
             }
             Err(Error::Syntax { offset, kind }) => {
@@ -672,11 +685,13 @@ mod tests {
         assert_eq!(out.record_offsets, vec![0, 6, 12]);
         assert_eq!(out.stringbuf.len(), 20);
         assert_eq!(contents(&out), vec![b"a".to_vec(), b"b".to_vec(), b"x\n".to_vec()]);
-        // Record bytes, exactly as the tape-format doc tabulates them
-        // (offset 19 is the gap byte — unspecified, NOT compared).
+        // The whole buffer, exactly as the tape-format doc tabulates it —
+        // offset 19 is the gap byte the \n escape shrank away, zero-filled
+        // by the careful path's epilogue (the 0xA5 poison must not survive).
         assert_eq!(&out.stringbuf[0..6], &[1, 0, 0, 0, b'a', 0]);
         assert_eq!(&out.stringbuf[6..12], &[1, 0, 0, 0, b'b', 0]);
         assert_eq!(&out.stringbuf[12..19], &[2, 0, 0, 0, b'x', 0x0A, 0]);
+        assert_eq!(out.stringbuf[19], 0, "slot gap byte is zero-filled");
         // The tape: string words at 2/9/10, zero holes everywhere else
         // (this runner dispatches neither K10 nor K12/K13).
         assert_eq!(out.tape.len(), 13);
@@ -1008,7 +1023,8 @@ mod tests {
         assert_eq!(out.tape[1], make_string(0));
 
         // Just over WITH an escape (raw_len = threshold + 1 via the 2-byte
-        // \n): the CPU unescape shrinks the record inside its slot.
+        // \n): the CPU unescape shrinks the record inside its slot, and
+        // the patch zero-fills the slot's one gap byte (poison erased).
         let body = format!("{}{}", "a".repeat(at - 1), r"\n");
         let out = stage.run(&ctx, &quoted(&[&body])).unwrap();
         assert_eq!(out.error, None);
@@ -1016,6 +1032,10 @@ mod tests {
         let mut want = vec![b'a'; at - 1];
         want.push(b'\n');
         assert_eq!(out.record_content(0), want);
+        // Slot = (at + 1) + 5 bytes; the record uses 4 + at + 1, leaving
+        // one gap byte at the very end.
+        assert_eq!(out.stringbuf.len(), at + 6);
+        assert_eq!(out.stringbuf[at + 5], 0, "CPU-patched slot gap is zero");
     }
 
     /// Long strings with an error PAST the threshold reject on the CPU
@@ -1155,11 +1175,13 @@ mod tests {
         assert_eq!(out.record_content(0), "\u{1F600}".as_bytes());
         assert_eq!(out.record_content(1), b"x");
         assert_eq!(out.record_content(2), b"yy");
-        // The record bytes around the gap: [4][😀][NUL] then unspecified
-        // gap bytes (NOT compared — the pinned policy), then record 1.
+        // The bytes around the gap: [4][😀][NUL], then the 8 slot-tail gap
+        // bytes zero-filled by the careful path (poison erased — the gap
+        // policy), then record 1.
         assert_eq!(&out.stringbuf[0..4], &[4, 0, 0, 0]);
         assert_eq!(&out.stringbuf[4..8], "\u{1F600}".as_bytes());
         assert_eq!(out.stringbuf[8], 0);
+        assert_eq!(&out.stringbuf[9..17], &[0u8; 8], "gap bytes are zero");
         assert_eq!(&out.stringbuf[17..23], &[1, 0, 0, 0, b'x', 0]);
         // Tape words point at the slot offsets.
         let t0 = out.stage2.string_tokens[0] as usize;
@@ -1408,10 +1430,12 @@ mod tests {
         /// what the runner dispatches. Inputs that pass stages 1–3 and 6
         /// compare every record offset, every record's
         /// `[u32 LE len][content][NUL]` bytes, every `"` tape word at
-        /// `tape_ofs[token]`, and that all remaining tape positions are
-        /// zero holes — gap bytes are never compared (the pinned policy).
-        /// Rejected inputs compare the packed verdict, with the documented
-        /// odd-quote offset exception.
+        /// `tape_ofs[token]`, that all remaining tape positions are zero
+        /// holes, and that every gap byte (escape-shrunk slot tail) is
+        /// zero — the 0xA5 poison pre-fill must not survive anywhere in
+        /// the buffer (the pinned gap policy). Rejected inputs compare
+        /// the packed verdict, with the documented odd-quote offset
+        /// exception.
         fn diff(stage: &StringsStage, ctx: &MetalContext, input: &[u8], label: &str) {
             let got = stage
                 .run(ctx, input)
@@ -1551,6 +1575,22 @@ mod tests {
                         if !is_string_pos[i] {
                             assert_eq!(word, 0, "{label}: hole at tape[{i}]");
                         }
+                    }
+                    // Every gap byte (between a record's NUL and the end of
+                    // its raw_len + 5 slot) is zero-filled — the poison
+                    // pre-fill must not survive into reachable bytes.
+                    for (s, rec) in records.iter().enumerate() {
+                        let off = usize::try_from(rec.record_offset).unwrap();
+                        let gap_start =
+                            off + STRING_RECORD_HEADER_BYTES + rec.bytes.len() + 1;
+                        let slot_end = records.get(s + 1).map_or(got.stringbuf.len(), |n| {
+                            usize::try_from(n.record_offset).unwrap()
+                        });
+                        assert!(
+                            got.stringbuf[gap_start..slot_end].iter().all(|&b| b == 0),
+                            "{label}: gap bytes of record {s} ({gap_start}..{slot_end}) \
+                             must be zero-filled"
+                        );
                     }
                 }
             }

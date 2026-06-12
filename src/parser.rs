@@ -35,10 +35,14 @@
 //!   `crate::pool`).
 //! - **Zero-copy `Document`**: the tape and string buffer stay in the
 //!   shared GPU memory the kernels wrote; [`Document`] reads them in place.
-//! - **Zero-copy input**: [`Parser::parse_file`] (mmap) and
-//!   [`Parser::parse_aligned`] (caller-held [`AlignedInput`]) wrap the
-//!   input pages with `bytesNoCopy` — no input byte is copied.
-//!   [`Parser::parse`] copies once, into a pooled buffer.
+//! - **Zero-copy input**: [`Parser::parse_aligned`] (caller-held
+//!   [`AlignedInput`]) and the **unsafe** [`Parser::parse_file_mmap`]
+//!   (private file mapping; the caller guarantees the file is not
+//!   truncated or modified mid-parse) wrap the input pages with
+//!   `bytesNoCopy` — no input byte is copied. [`Parser::parse`] and the
+//!   safe [`Parser::parse_file`] copy once, into a pooled buffer
+//!   (`parse_file` reads the file directly into it, no intermediate
+//!   allocation).
 
 use std::path::Path;
 use std::rc::Rc;
@@ -287,20 +291,26 @@ impl Parser {
         }
     }
 
-    /// Parse a JSON file — the guaranteed **zero-copy** input path on the
-    /// GPU backend: the file is mmap'd (private, copy-on-write — the file
-    /// is never modified), the tail of the last 64-byte word is
-    /// space-padded in the private mapping, and the pages are wrapped with
-    /// `bytesNoCopy` for the parse. The mapping is held for the parse
-    /// duration only; the returned [`Document`] never borrows the input.
+    /// Parse a JSON file. On the GPU backend the file is read **once**,
+    /// directly into a pooled page-aligned GPU buffer (no intermediate
+    /// allocation), space-padded like every other input path — the same
+    /// one-copy cost as [`parse`](Self::parse). The returned [`Document`]
+    /// never borrows the input.
+    ///
+    /// This function is safe against concurrent modification of the file:
+    /// it reads through ordinary file I/O, so a racing truncation surfaces
+    /// as [`Error::Io`], never a crash. Callers who can guarantee the file
+    /// is not modified during the parse can use the zero-copy
+    /// [`parse_file_mmap`](Self::parse_file_mmap) instead.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the file cannot be opened or mapped, otherwise as
+    /// [`Error::Io`] if the file cannot be opened or read (including a
+    /// concurrent truncation mid-read), otherwise as
     /// [`parse`](Self::parse).
     pub fn parse_file(&self, path: impl AsRef<Path>) -> Result<Document> {
         match self.opts.backend {
-            Backend::Gpu => self.parse_file_gpu(path.as_ref()),
+            Backend::Gpu => self.parse_file_gpu_copy(path.as_ref()),
             #[cfg(feature = "cpu-reference")]
             Backend::CpuReference => {
                 let bytes = std::fs::read(path)?;
@@ -309,7 +319,88 @@ impl Parser {
         }
     }
 
-    fn parse_file_gpu(&self, path: &Path) -> Result<Document> {
+    /// Parse a JSON file via a private (copy-on-write) mmap — the
+    /// **zero-copy** file input path on the GPU backend: the mapped pages
+    /// are wrapped with `MTLBuffer bytesNoCopy` and read by the GPU in
+    /// place, the tail of the last 64-byte word space-padded in the
+    /// private mapping (the file is never written). The mapping is held
+    /// for the parse duration only; the returned [`Document`] never
+    /// borrows the input. Behaves identically to
+    /// [`parse_file`](Self::parse_file) otherwise — including on the
+    /// `cpu-reference` backend, where it reads the file normally (the
+    /// oracle parses any slice; no mapping is created).
+    ///
+    /// # Safety
+    ///
+    /// The file must not be **truncated or modified** — by this process or
+    /// any other — for the entire duration of the call. A `MAP_PRIVATE`
+    /// (copy-on-write) mapping does not protect against concurrent
+    /// truncation: if the file shrinks while the parse (CPU padding write,
+    /// GPU kernels, or the CPU fixup passes) touches a page that no longer
+    /// has file backing, the process receives `SIGBUS` — i.e. undefined
+    /// behavior, not an `Err`. Concurrent *writes* that keep the length
+    /// can also tear the mapped bytes mid-parse, violating the memory
+    /// model the parse relies on. If you cannot rule both out, use the
+    /// safe, copying [`parse_file`](Self::parse_file).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be opened or mapped, otherwise as
+    /// [`parse`](Self::parse).
+    pub unsafe fn parse_file_mmap(&self, path: impl AsRef<Path>) -> Result<Document> {
+        match self.opts.backend {
+            Backend::Gpu => self.parse_file_gpu_mmap(path.as_ref()),
+            #[cfg(feature = "cpu-reference")]
+            Backend::CpuReference => {
+                let bytes = std::fs::read(path)?;
+                self.parse(&bytes)
+            }
+        }
+    }
+
+    /// The safe `parse_file` body: open, size-check, then read straight
+    /// into a pooled space-padded buffer (one copy, no intermediate `Vec`)
+    /// and hand it to the pipeline as [`GpuInput::Pooled`].
+    fn parse_file_gpu_copy(&self, path: &Path) -> Result<Document> {
+        use std::io::Read;
+
+        let gpu = self.gpu.as_ref().expect("Gpu backend constructed its state");
+        let mut file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len > MAX_INPUT_BYTES {
+            return Err(Error::InputTooLarge {
+                len: file_len,
+                max: MAX_INPUT_BYTES,
+            });
+        }
+        let len = usize::try_from(file_len).expect("checked against MAX_INPUT_BYTES");
+        if len == 0 {
+            // The empty verdict needs no GPU (and no buffer).
+            return self.parse(&[]);
+        }
+
+        // The one copy: file → pooled GPU buffer, padded with ASCII spaces
+        // to the 64-byte word boundary (the stage-1 invariant every input
+        // path establishes). A concurrent truncation makes read_exact
+        // return UnexpectedEof → Error::Io — never a fault.
+        let padded_len = len.next_multiple_of(WORD_BYTES);
+        let mut buffer = gpu.pool.checkout(&gpu.ctx, padded_len)?;
+        let contents = buffer.contents_mut();
+        file.read_exact(&mut contents[..len])?;
+        contents[len..].fill(b' ');
+
+        let parse = gpu.pipeline.run_pooled(
+            &gpu.ctx,
+            &gpu.pool,
+            GpuInput::Pooled { buffer, len },
+            self.opts.max_depth,
+        )?;
+        self.finish_gpu(parse)
+    }
+
+    /// The `parse_file_mmap` body (the caller upholds the no-modification
+    /// contract; see `parse_file_mmap`'s `# Safety`).
+    fn parse_file_gpu_mmap(&self, path: &Path) -> Result<Document> {
         let gpu = self.gpu.as_ref().expect("Gpu backend constructed its state");
         let file = std::fs::File::open(path)?;
         let file_len = file.metadata()?.len();
@@ -331,7 +422,8 @@ impl Parser {
         // same padding the copied path writes), and a COW mapping lets that
         // tail be written without touching the file. The padded length
         // never crosses into a page beyond the file's last page (64 divides
-        // the page size), so every touched byte is file-backed.
+        // the page size), so every touched byte is file-backed — as long as
+        // the caller-guaranteed no-truncation contract holds.
         let padded_len = len.next_multiple_of(WORD_BYTES);
         let mut map = unsafe { memmap2::MmapOptions::new().len(padded_len).map_copy(&file) }?;
         map[len..padded_len].fill(b' ');
@@ -341,7 +433,10 @@ impl Parser {
         // `len.next_multiple_of(PAGE_SIZE)` bytes of one valid
         // readable+writable (MAP_PRIVATE) allocation; `map` outlives the
         // wrapper, which is dropped inside `run_pooled`; the CPU does not
-        // touch the mapping after the space-fill above.
+        // touch the mapping after the space-fill above. The caller of
+        // `parse_file_mmap` guarantees the underlying file is neither
+        // truncated nor modified for the duration of the call (unfaulted
+        // pages of a COW mapping otherwise SIGBUS on access).
         let buffer = unsafe { GpuBuffer::from_page_aligned(&gpu.ctx, ptr, len)? };
         let parse = gpu.pipeline.run_pooled(
             &gpu.ctx,
@@ -383,7 +478,18 @@ mod tests {
     /// `METAL_JSON_REQUIRE_GPU=1` makes that a hard failure.
     fn gpu_parser_or_skip(test: &str) -> Option<Parser> {
         match Parser::new() {
-            Ok(parser) => Some(parser),
+            // `Parser::new` succeeding is not enough: when the device probe
+            // fails (no device, or METAL_JSON_DISABLE_GPU=1) the default
+            // backend falls back to the CPU reference — these tests want
+            // the GPU specifically.
+            Ok(parser) if parser.options().backend == Backend::Gpu => Some(parser),
+            Ok(_) => {
+                if std::env::var_os("METAL_JSON_REQUIRE_GPU").is_some_and(|v| v == "1") {
+                    panic!("METAL_JSON_REQUIRE_GPU=1 but the default backend is not Gpu");
+                }
+                eprintln!("SKIP {test}: no usable Metal device here (CPU fallback default)");
+                None
+            }
             Err(err) => {
                 if std::env::var_os("METAL_JSON_REQUIRE_GPU").is_some_and(|v| v == "1") {
                     panic!("METAL_JSON_REQUIRE_GPU=1 but no usable Metal device: {err}");

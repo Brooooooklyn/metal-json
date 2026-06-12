@@ -10,7 +10,16 @@ env:
 
 jobs:
   test:
-    # macos-15 runners are Apple Silicon with a real Metal GPU.
+    # macos-15 runners are Apple Silicon, but the GPU is an "Apple
+    # Paravirtual device" whose backend shader compiler crashes
+    # nondeterministically while building this crate's pipeline states
+    # (different kernel each run; once it dies, every later PSO in the
+    # process fails — see the PSO probe step output). GPU tests therefore
+    # CANNOT run reliably on GitHub-hosted runners; they are explicitly
+    # disabled here via METAL_JSON_DISABLE_GPU and run on real hardware
+    # instead. CI still covers the entire CPU side: the cpu-reference
+    # oracle test suite (the bit-exact spec the GPU kernels diff against),
+    # build, clippy, and the bench/xtask crates.
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -18,31 +27,29 @@ jobs:
         run: cargo build --workspace
       - name: Fetch JSONTestSuite
         run: bash scripts/fetch_jsontestsuite.sh
-      - name: PSO probe (diagnostics)
-        # Paravirtual CI devices have rejected some kernels at PSO-creation
-        # time with a bare "Compilation failed"; this prints the per-kernel
-        # verdicts and full NSError, with shader validation off and on.
+      - name: PSO probe (canary)
+        # Tries to build every kernel's pipeline state on the runner's
+        # paravirtual device and prints per-kernel verdicts. Informational:
+        # when this starts reporting "0 of 27 kernels failed" across a few
+        # runs, the VM Metal stack has been fixed and the
+        # METAL_JSON_DISABLE_GPU gating below can be removed.
         continue-on-error: true
         run: |
           cargo run --example pso_probe
           MTL_SHADER_VALIDATION=1 cargo run --example pso_probe
-      - name: Test
+      - name: Test (CPU reference + non-GPU)
         run: |
           cargo test --workspace
           cargo test -p metal-json --features cpu-reference
         env:
-          MTL_SHADER_VALIDATION: "1"
-          # CI runners must have a Metal device; never let GPU tests
-          # silently skip here.
-          METAL_JSON_REQUIRE_GPU: "1"
-      - name: Test (runtime-shaders fallback path)
+          # GPU tests skip loudly (see MetalContext::new); the cpu-reference
+          # oracle suite carries the differential coverage on CI.
+          METAL_JSON_DISABLE_GPU: "1"
+      - name: Test (runtime-shaders, CPU paths)
         run: |
           cargo test -p metal-json --features runtime-shaders
-          # The M4 end-to-end gate (needs the cpu-reference oracle) on the
-          # runtime-compiled shader path too.
           cargo test -p metal-json --features runtime-shaders,cpu-reference --test gpu_e2e
         env:
-          MTL_SHADER_VALIDATION: "1"
-          METAL_JSON_REQUIRE_GPU: "1"
+          METAL_JSON_DISABLE_GPU: "1"
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
