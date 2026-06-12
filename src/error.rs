@@ -87,6 +87,12 @@ pub enum Error {
     /// Filesystem error (e.g. `parse_file` mmap).
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// The parsed document could not be materialized as the requested
+    /// serde data model.
+    #[cfg(feature = "serde")]
+    #[error(transparent)]
+    Deserialize(#[from] crate::serde::DeserializeError),
 }
 
 /// Fine-grained classification for [`Error::Syntax`].

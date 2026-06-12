@@ -72,6 +72,22 @@ impl Document {
     pub fn strings(&self) -> &StringBuffer {
         &self.strings
     }
+
+    /// Deserialize the root value into a serde data model.
+    ///
+    /// The returned value may borrow strings from this [`Document`], so the
+    /// document must outlive any borrowed fields in `T`.
+    ///
+    /// # Errors
+    ///
+    /// If the root value's shape or scalar values do not match `T`.
+    #[cfg(feature = "serde")]
+    pub fn deserialize<'de, T>(&'de self) -> crate::serde::Result<T>
+    where
+        T: ::serde::Deserialize<'de>,
+    {
+        crate::serde::from_document(self)
+    }
 }
 
 #[cfg(test)]

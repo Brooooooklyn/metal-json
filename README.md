@@ -61,6 +61,31 @@ fn main() -> Result<(), metal_json::Error> {
 }
 ```
 
+With the `serde` feature, you can deserialize the parsed document into a
+typed data model:
+
+```rust
+use metal_json::Parser;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Payload {
+    name: String,
+    tags: Vec<f64>,
+}
+
+fn main() -> Result<(), metal_json::Error> {
+    let parser = Parser::new()?;
+    let payload: Payload = parser.parse_deserialize(br#"{"name":"meow","tags":[1,2.5]}"#)?;
+    assert_eq!(payload.tags[1], 2.5);
+    Ok(())
+}
+```
+
+`parse_deserialize` returns an owned value. If your struct borrows strings,
+parse to a `Document` first and call `doc.deserialize()` so the document can
+outlive the borrowed fields.
+
 `Parser` is reusable (device, pipeline states, and a buffer pool are built
 once); `Document` is self-contained and returns its buffers to the pool on
 drop. For repeated parsing without input copies, fill a parser-provided
@@ -88,9 +113,25 @@ modified for the duration of the parse — truncating a mapped file can
 - **macOS on Apple Silicon** (unified memory is the point: input bytes map
   into the GPU with `MTLBuffer bytesNoCopy`, output tapes live in shared
   storage — zero copies either way).
-- Xcode Metal toolchain for the AOT shader build
-  (`xcodebuild -downloadComponent MetalToolchain`), or build with
-  `--features runtime-shaders` to compile MSL at runtime instead.
+- For broad prebuilt binaries, build with `--features runtime-shaders` so
+  the shader source is compiled on the user's actual Metal device/runtime.
+  AOT metallibs are best for controlled deployments where the target GPU
+  family and macOS/Metal runtime are known.
+- Source builds without `runtime-shaders` require the Xcode Metal toolchain
+  for the AOT shader build (`xcodebuild -downloadComponent MetalToolchain`).
+
+## Feature flags
+
+- `runtime-shaders` — compile MSL at runtime instead of embedding an AOT
+  metallib. This is the preferred compatibility mode for distributed
+  prebuilt binaries and also supports `METAL_JSON_SHADER_DIR` hot reload
+  during shader development.
+- `cpu-reference` — scalar CPU oracle backend, mainly for testing and
+  backend parity work.
+- `timing` — per-kernel GPU timing helpers.
+- `serde` — deserialize parsed `Document`/`Value` cursors into serde data
+  models. This can avoid an intermediate `serde_json::Value` and skip manual
+  tape traversal, but it does not skip JSON validation/parsing itself.
 
 ## Architecture
 

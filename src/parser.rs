@@ -251,6 +251,27 @@ impl Parser {
         }
     }
 
+    /// Parse a JSON document and deserialize it into an owned serde data
+    /// model.
+    ///
+    /// This convenience path returns only `T`, so `T` must own its data.
+    /// Use [`Document::deserialize`](crate::Document::deserialize) or
+    /// [`crate::serde::from_document`] when `T` contains borrowed string
+    /// fields.
+    ///
+    /// # Errors
+    ///
+    /// Any parse failure from [`parse`](Self::parse), or a serde
+    /// deserialization error if the parsed document does not match `T`.
+    #[cfg(feature = "serde")]
+    pub fn parse_deserialize<T>(&self, json: &[u8]) -> Result<T>
+    where
+        T: ::serde::de::DeserializeOwned,
+    {
+        let doc = self.parse(json)?;
+        Ok(crate::serde::from_document(&doc)?)
+    }
+
     /// Parse from a caller-held [`AlignedInput`] — the **zero-copy** input
     /// path: the input pages are wrapped with `MTLBuffer bytesNoCopy` and
     /// read by the GPU in place. Build the `AlignedInput` once, parse from

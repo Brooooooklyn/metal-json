@@ -258,6 +258,23 @@ impl<'doc> Value<'doc> {
             }
         }
     }
+
+    /// Deserialize this value into a serde data model.
+    ///
+    /// The returned value may borrow strings from the backing
+    /// [`Document`], so that document must outlive any borrowed fields in
+    /// `T`.
+    ///
+    /// # Errors
+    ///
+    /// If this value's shape or scalar values do not match `T`.
+    #[cfg(feature = "serde")]
+    pub fn deserialize<T>(self) -> crate::serde::Result<T>
+    where
+        T: ::serde::Deserialize<'doc>,
+    {
+        crate::serde::from_value(self)
+    }
 }
 
 impl std::fmt::Debug for Value<'_> {

@@ -19,6 +19,7 @@ objc2-metal = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
 memmap2 = "0.9"
+serde = { version = "1", optional = true }
 thiserror = "2"
 
 [features]
@@ -31,8 +32,11 @@ runtime-shaders = []
 cpu-reference = []
 # Per-kernel GPU timing via MTLCounterSampleBuffer (lands in M5).
 timing = []
+# Deserialize parsed Documents/Values into serde data models.
+serde = ["dep:serde"]
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 proptest = "1"
 

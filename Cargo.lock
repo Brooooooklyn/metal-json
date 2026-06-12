@@ -507,6 +507,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "proptest",
+ "serde",
  "serde_json",
  "thiserror",
 ]
