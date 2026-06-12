@@ -30,7 +30,11 @@ impl Pipeline {
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| Error::PipelineCreate {
                 name: kernel_name.to_owned(),
-                message: e.localizedDescription().to_string(),
+                // The full NSError debug form keeps the userInfo dictionary;
+                // localizedDescription alone is often just "Compilation
+                // failed" while the actual compiler diagnostic hides in
+                // userInfo (seen on paravirtual CI devices).
+                message: format!("{e:?}"),
             })?;
         Ok(Self {
             state,

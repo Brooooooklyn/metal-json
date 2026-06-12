@@ -49,6 +49,26 @@ impl MetalContext {
     pub(crate) fn library(&self) -> &ProtocolObject<dyn MTLLibrary> {
         &self.library
     }
+
+    /// Name of the underlying Metal device (diagnostics).
+    pub fn device_name(&self) -> String {
+        self.device.name().to_string()
+    }
+
+    /// Every kernel function name in the loaded shader library, sorted.
+    /// Diagnostics surface (see `examples/pso_probe.rs`): lets a probe build
+    /// each pipeline-state object individually and report which ones the
+    /// device's backend compiler rejects.
+    pub fn kernel_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .library
+            .functionNames()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        names.sort();
+        names
+    }
 }
 
 impl std::fmt::Debug for MetalContext {

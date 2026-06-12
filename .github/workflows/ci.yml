@@ -18,6 +18,14 @@ jobs:
         run: cargo build --workspace
       - name: Fetch JSONTestSuite
         run: bash scripts/fetch_jsontestsuite.sh
+      - name: PSO probe (diagnostics)
+        # Paravirtual CI devices have rejected some kernels at PSO-creation
+        # time with a bare "Compilation failed"; this prints the per-kernel
+        # verdicts and full NSError, with shader validation off and on.
+        continue-on-error: true
+        run: |
+          cargo run --example pso_probe
+          MTL_SHADER_VALIDATION=1 cargo run --example pso_probe
       - name: Test
         run: |
           cargo test --workspace

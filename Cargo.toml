@@ -7,10 +7,10 @@ name = "metal-json"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "GPU JSON parser on Apple Metal: parse-to-tape faster than simdjson on large inputs"
 repository = "https://github.com/Brooooooklyn/metal-json"
-include = ["src/**", "shaders/**", "build.rs", "README.md"]
+include = ["src/**", "shaders/**", "build.rs", "README.md", "LICENSE"]
 
 [dependencies]
 objc2 = "0.6"
