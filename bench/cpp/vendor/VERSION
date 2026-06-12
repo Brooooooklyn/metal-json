@@ -1,0 +1,7 @@
+simdjson amalgamation (https://github.com/simdjson/simdjson/releases)
+tag: v4.6.4
+sha256:
+fec0cb4559e25456789efb153b7e5eaa27b50ce2bc2c9d3b531ea2000928380a  simdjson.h
+826660ed60cf467641ab2f93a0e1a2dacf603c444f76d835358c814bc2caba3a  simdjson.cpp
+
+Refresh with: scripts/update_simdjson_amalgamation.sh [tag]
