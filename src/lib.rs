@@ -49,12 +49,14 @@
 //! - `timing` — per-kernel GPU timing via `MTLCounterSampleBuffer` (M5).
 
 mod error;
+mod input;
 mod unescape;
 
 pub mod document;
 pub mod gpu;
 pub mod metal;
 pub mod parser;
+pub mod pool;
 pub mod stage;
 pub mod tape;
 pub mod value;
@@ -64,5 +66,6 @@ pub mod reference;
 
 pub use document::Document;
 pub use error::{Error, Result, SyntaxErrorKind};
+pub use input::AlignedInput;
 pub use parser::{Backend, Parser, ParserOptions};
 pub use value::{Value, ValueKind};

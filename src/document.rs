@@ -91,6 +91,19 @@ mod tests {
         Document::from_parts(tape, StringBuffer::new())
     }
 
+    /// The M5 pin: a `Document` is `Send + Sync` no matter which backing
+    /// store its buffers use (the GPU-backed storage carries audited
+    /// `Send`/`Sync` impls on `GpuBuffer` and an `Arc<ScratchPool>`).
+    /// Compile-time; covers both storage variants because the bound is on
+    /// the type, not a value.
+    #[test]
+    fn document_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Document>();
+        assert_send_sync::<TapeBuffer>();
+        assert_send_sync::<StringBuffer>();
+    }
+
     #[test]
     fn root_is_the_word_after_tape_zero() {
         let doc = null_doc();

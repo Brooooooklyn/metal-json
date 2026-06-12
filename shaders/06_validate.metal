@@ -88,9 +88,15 @@ static inline bool mj_pair_allowed(uint prev_kind, uint next_kind) {
 // (the arm ORDER there is load-bearing: QuoteOpen first, then open-at-end,
 // then the two-values MissingComma case, then the generic fallbacks).
 // Returns the packed error, or MJ_HEADER_NO_ERROR.
+//
+// Positions come in as (tok_pos, index) instead of preloaded values: every
+// arm that needs an offset guards on its kind being real (!= MJ_TOK_NONE),
+// so the index is valid exactly when it is read — and the clean fast path
+// (the table hit) issues NO position loads at all.
 static inline uint64_t mj_check_adjacent(
-    uint prev_kind, ulong prev_pos,
-    uint next_kind, ulong next_pos,
+    device const uint* tok_pos,
+    uint prev_kind, ulong prev_t,
+    uint next_kind, ulong next_t,
     ulong input_len)
 {
     if (mj_pair_allowed(prev_kind, next_kind)) {
@@ -100,21 +106,21 @@ static inline uint64_t mj_check_adjacent(
         // Unreachable post-CB1 (odd quote totals are rejected there, and an
         // even total makes every QuoteOpen's next token its QuoteClose);
         // kept so the table stays a complete mirror of the reference.
-        return mj_pack_error(prev_pos, MJ_ERR_UNTERMINATED_STRING);
+        return mj_pack_error(ulong(tok_pos[prev_t]), MJ_ERR_UNTERMINATED_STRING);
     }
     if (next_kind == MJ_TOK_NONE
         && (prev_kind == MJ_TOK_LBRACE || prev_kind == MJ_TOK_LBRACKET)) {
         // Input ends right after an open bracket: report the bracket.
-        return mj_pack_error(prev_pos, MJ_ERR_UNBALANCED);
+        return mj_pack_error(ulong(tok_pos[prev_t]), MJ_ERR_UNBALANCED);
     }
     if (prev_kind != MJ_TOK_NONE && next_kind != MJ_TOK_NONE
         && ((MJ_VALUE_END_MASK >> prev_kind) & 1u) != 0u
         && ((MJ_VALUE_START_MASK >> next_kind) & 1u) != 0u) {
         // Two values back to back: a comma is missing between them.
-        return mj_pack_error(next_pos, MJ_ERR_MISSING_COMMA);
+        return mj_pack_error(ulong(tok_pos[next_t]), MJ_ERR_MISSING_COMMA);
     }
     if (next_kind != MJ_TOK_NONE) {
-        return mj_pack_error(next_pos, MJ_ERR_UNEXPECTED_TOKEN);
+        return mj_pack_error(ulong(tok_pos[next_t]), MJ_ERR_UNEXPECTED_TOKEN);
     }
     return mj_pack_error(input_len, MJ_ERR_UNEXPECTED_TOKEN);
 }
@@ -175,6 +181,24 @@ struct MjTokenInfo {
     uchar skel_byte; // the SkeletonRecord byte: one of { } [ ] : ,
 };
 
+// The kind-determined MjTokenInfo fields as one packed constant word per
+// kind (indexed like MJ_PAIR_ALLOWED): skel_byte in bits 0-7, footprint in
+// bits 8-9, skel / str / scalar flags in bits 10-12. A table load replaces
+// the old 7-way switch — only the two data-dependent fixups (QuoteOpen
+// slot bytes, ScalarStart number-vs-literal footprint) stay branchy, which
+// keeps the common path convergent across a mixed-kind simdgroup.
+constant uint MJ_TOKEN_INFO[9] = {
+    /* LBrace      */ uint('{') | (1u << 8) | (1u << 10),
+    /* RBrace      */ uint('}') | (1u << 8) | (1u << 10),
+    /* LBracket    */ uint('[') | (1u << 8) | (1u << 10),
+    /* RBracket    */ uint(']') | (1u << 8) | (1u << 10),
+    /* Colon       */ uint(':') | (1u << 10),
+    /* Comma       */ uint(',') | (1u << 10),
+    /* QuoteOpen   */ (1u << 8) | (1u << 11),
+    /* QuoteClose  */ 0u, // 0 tape words; the open quote owns the record
+    /* ScalarStart */ (1u << 8) | (1u << 12),
+};
+
 static inline MjTokenInfo mj_token_info(
     device const uchar* input,
     device const uint* tok_pos,
@@ -182,40 +206,32 @@ static inline MjTokenInfo mj_token_info(
     ulong t,
     ulong n)
 {
-    MjTokenInfo info = { 0u, 0u, 0u, 0u, 0u, uchar(0) };
-    switch (tok_kind[t]) {
-        case MJ_TOK_LBRACE:   info.footprint = 1u; info.skel = 1u; info.skel_byte = uchar('{'); break;
-        case MJ_TOK_RBRACE:   info.footprint = 1u; info.skel = 1u; info.skel_byte = uchar('}'); break;
-        case MJ_TOK_LBRACKET: info.footprint = 1u; info.skel = 1u; info.skel_byte = uchar('['); break;
-        case MJ_TOK_RBRACKET: info.footprint = 1u; info.skel = 1u; info.skel_byte = uchar(']'); break;
-        case MJ_TOK_COLON:    info.skel = 1u; info.skel_byte = uchar(':'); break;
-        case MJ_TOK_COMMA:    info.skel = 1u; info.skel_byte = uchar(','); break;
-        case MJ_TOK_QUOTE_OPEN: {
-            info.footprint = 1u;
-            info.str = 1u;
-            // The close quote is the very next token (stage-2 adjacency;
-            // guaranteed post-CB1 by the even quote total). raw_len is the
-            // byte count strictly between the quotes; the slot adds the
-            // 4-byte length prefix + NUL of the string record
-            // (docs/tape-format.md: raw_len + 5). The t+1 guard is
-            // defensive only (a lone trailing open cannot reach K6).
-            uint raw_len = (t + 1 < n) ? (tok_pos[t + 1] - tok_pos[t] - 1u) : 0u;
-            info.slot_bytes = raw_len + 5u;
-            break;
-        }
-        case MJ_TOK_QUOTE_CLOSE:
-            break; // 0 tape words; the open quote owns the record
-        default: { // MJ_TOK_SCALAR_START
-            info.scalar = 1u;
-            uchar b = input[tok_pos[t]];
-            // Numbers occupy two tape words (marker + value); literals one.
-            // A byte that cannot begin a scalar is a Layer-1 error (the
-            // validation below reports it); its footprint value is never
-            // observed — rejection keeps CB2b from running — but is pinned
-            // to 1 so K6 and K6b stay bit-identical on every input.
-            info.footprint = (b == uchar('-') || (b >= uchar('0') && b <= uchar('9'))) ? 2u : 1u;
-            break;
-        }
+    uint kind = uint(tok_kind[t]);
+    uint w = MJ_TOKEN_INFO[kind];
+    MjTokenInfo info;
+    info.footprint = (w >> 8) & 3u;
+    info.slot_bytes = 0u;
+    info.skel = (w >> 10) & 1u;
+    info.str = (w >> 11) & 1u;
+    info.scalar = (w >> 12) & 1u;
+    info.skel_byte = uchar(w & 0xFFu);
+    if (kind == MJ_TOK_QUOTE_OPEN) {
+        // The close quote is the very next token (stage-2 adjacency;
+        // guaranteed post-CB1 by the even quote total). raw_len is the
+        // byte count strictly between the quotes; the slot adds the
+        // 4-byte length prefix + NUL of the string record
+        // (docs/tape-format.md: raw_len + 5). The t+1 guard is
+        // defensive only (a lone trailing open cannot reach K6).
+        uint raw_len = (t + 1 < n) ? (tok_pos[t + 1] - tok_pos[t] - 1u) : 0u;
+        info.slot_bytes = raw_len + 5u;
+    } else if (kind == MJ_TOK_SCALAR_START) {
+        uchar b = input[tok_pos[t]];
+        // Numbers occupy two tape words (marker + value); literals one.
+        // A byte that cannot begin a scalar is a Layer-1 error (the
+        // validation below reports it); its footprint value is never
+        // observed — rejection keeps CB2b from running — but is pinned
+        // to 1 so K6 and K6b stay bit-identical on every input.
+        info.footprint = (b == uchar('-') || (b >= uchar('0') && b <= uchar('9'))) ? 2u : 1u;
     }
     return info;
 }
@@ -240,13 +256,11 @@ static inline uint64_t mj_validate_token(
 {
     uint64_t err = MJ_HEADER_NO_ERROR;
     uint kind = uint(tok_kind[t]);
-    ulong pos = ulong(tok_pos[t]);
 
     uint prev_kind = (t > 0) ? uint(tok_kind[t - 1]) : MJ_TOK_NONE;
-    ulong prev_pos = (t > 0) ? ulong(tok_pos[t - 1]) : 0;
-    err = min(err, mj_check_adjacent(prev_kind, prev_pos, kind, pos, input_len));
+    err = min(err, mj_check_adjacent(tok_pos, prev_kind, t - 1, kind, t, input_len));
     if (t + 1 == n) {
-        err = min(err, mj_check_adjacent(kind, pos, MJ_TOK_NONE, 0, input_len));
+        err = min(err, mj_check_adjacent(tok_pos, kind, t, MJ_TOK_NONE, 0, input_len));
     }
 
     if (kind == MJ_TOK_LBRACE) {
@@ -272,9 +286,10 @@ static inline uint64_t mj_validate_token(
         bool ok = (t >= 3)
             && (uint(tok_kind[t - 3]) == MJ_TOK_LBRACE || uint(tok_kind[t - 3]) == MJ_TOK_COMMA);
         if (!ok) {
-            err = min(err, mj_pack_error(pos, MJ_ERR_UNEXPECTED_TOKEN));
+            err = min(err, mj_pack_error(ulong(tok_pos[t]), MJ_ERR_UNEXPECTED_TOKEN));
         }
     } else if (kind == MJ_TOK_SCALAR_START) {
+        ulong pos = ulong(tok_pos[t]);
         uchar b = input[pos];
         if (b == uchar('-') || (b >= uchar('0') && b <= uchar('9'))) {
             // Number grammar is K10's job (M4); Layer 1 accepts the run.
@@ -291,6 +306,34 @@ static inline uint64_t mj_validate_token(
 
 // --- K6 ---------------------------------------------------------------------------
 
+// 32-lane simdgroup reductions of the two 64-bit per-chunk quantities (the
+// simd_* intrinsics only take 32-bit scalars, so shuffle the halves and
+// recombine). Both ops are commutative and associative — any fold shape is
+// exact — and lanes past the guard contribute nothing (shuffle-down
+// garbage from beyond the simdgroup is never combined). Lane 0 holds the
+// result.
+static inline uint64_t mj_simd_sum_u64(uint64_t v, uint simd_lane) {
+    for (uint d = 16u; d > 0u; d >>= 1u) {
+        uint lo = simd_shuffle_down(uint(v), ushort(d));
+        uint hi = simd_shuffle_down(uint(v >> 32), ushort(d));
+        if (simd_lane + d < 32u) {
+            v += (uint64_t(hi) << 32) | uint64_t(lo);
+        }
+    }
+    return v;
+}
+
+static inline uint64_t mj_simd_min_u64(uint64_t v, uint simd_lane) {
+    for (uint d = 16u; d > 0u; d >>= 1u) {
+        uint lo = simd_shuffle_down(uint(v), ushort(d));
+        uint hi = simd_shuffle_down(uint(v >> 32), ushort(d));
+        if (simd_lane + d < 32u) {
+            v = min(v, (uint64_t(hi) << 32) | uint64_t(lo));
+        }
+    }
+    return v;
+}
+
 // One threadgroup per 1024-token chunk, 4 tokens per thread. Validates every
 // token and reduces the chunk's
 //   uint4 (tape words, skeleton, string, scalar) counts -> chunk_counts,
@@ -299,6 +342,12 @@ static inline uint64_t mj_validate_token(
 // all single-writer plain stores (thread 0), no device atomics. K7 scans /
 // folds these. The three chunk buffers are fully overwritten for every
 // chunk in the grid, so they carry no zero/init precondition.
+//
+// Reduction shape: simd_sum / shuffle reductions collapse each simdgroup
+// to one lane, then thread 0 folds the 8 simdgroup results — ONE
+// threadgroup barrier total. (The original threadgroup scan + two 256-step
+// serial thread-0 ladders parked all 255 other threads at barriers twice
+// per chunk; the same pattern measurably throttled pair_ctx_apply.)
 kernel void token_validate_footprint(
     device const uchar* input [[buffer(0)]],
     device const uint* tok_pos [[buffer(1)]],
@@ -312,8 +361,9 @@ kernel void token_validate_footprint(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_id [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup uint4 parts4[9];
-    threadgroup ulong lanes[THREADGROUP_SIZE];
+    threadgroup uint4 simd_counts[THREADGROUP_SIZE / 32u];
+    threadgroup ulong simd_slots[THREADGROUP_SIZE / 32u];
+    threadgroup ulong simd_errs[THREADGROUP_SIZE / 32u];
 
     ulong n = params.element_count; // token_total
     ulong input_len = params.input_len;
@@ -335,33 +385,31 @@ kernel void token_validate_footprint(
         }
     }
 
-    // uint4 totals via the scan's grand-total slot (every thread converges).
-    tg_exclusive_scan4_256(counts, simd_lane, simd_id, parts4);
-
-    // ulong string-byte sum: per-chunk partials can exceed u32 (one giant
-    // string literal), so reduce in 64-bit via threadgroup memory + a
-    // 256-step serial fold on thread 0 (cheap; the spine pattern's cost
-    // model). Reuse `lanes` afterwards for the error min.
-    lanes[lid] = slot_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0u) {
-        ulong total = 0;
-        for (uint i = 0u; i < THREADGROUP_SIZE; ++i) {
-            total += lanes[i];
-        }
-        chunk_string_bytes[tgid] = total;
+    // Per-simdgroup partials in registers (uint4 counts via simd_sum; the
+    // two 64-bit values via the shuffle reductions above — per-chunk slot
+    // sums can exceed u32, e.g. one giant string literal), then one
+    // barrier and a thread-0 fold of the 8 simdgroup results.
+    uint4 counts_sum = simd_sum(counts);
+    uint64_t simd_slot = mj_simd_sum_u64(slot_sum, simd_lane);
+    uint64_t simd_err = mj_simd_min_u64(err, simd_lane);
+    if (simd_lane == 0u) {
+        simd_counts[simd_id] = counts_sum;
+        simd_slots[simd_id] = simd_slot;
+        simd_errs[simd_id] = simd_err;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    lanes[lid] = err;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0u) {
+        uint4 total4 = uint4(0u);
+        ulong total = 0;
         uint64_t chunk_min = MJ_HEADER_NO_ERROR;
-        for (uint i = 0u; i < THREADGROUP_SIZE; ++i) {
-            chunk_min = min(chunk_min, lanes[i]);
+        for (uint i = 0u; i < THREADGROUP_SIZE / 32u; ++i) {
+            total4 += simd_counts[i];
+            total += simd_slots[i];
+            chunk_min = min(chunk_min, simd_errs[i]);
         }
+        chunk_counts[tgid] = total4;
+        chunk_string_bytes[tgid] = total;
         chunk_error[tgid] = chunk_min;
-        chunk_counts[tgid] = parts4[8];
     }
 }
 

@@ -35,3 +35,7 @@ timing = []
 [dev-dependencies]
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 proptest = "1"
+
+[[example]]
+name = "parse_breakdown"
+required-features = ["timing"]

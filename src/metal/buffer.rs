@@ -114,6 +114,30 @@ impl GpuBuffer {
         self.len
     }
 
+    /// Capacity in bytes: the length of the underlying `MTLBuffer`
+    /// allocation (page-granular for pooled / no-copy buffers). Always
+    /// `>= len()`.
+    pub(crate) fn capacity(&self) -> usize {
+        self.raw.length()
+    }
+
+    /// Re-aim the logical length at `len` bytes of the existing allocation
+    /// (the buffer-pool reuse path: capacity is kept, the logical view
+    /// shrinks or grows within it). Contents are whatever the previous user
+    /// left — exactly the [`alloc`](Self::alloc) non-guarantee.
+    ///
+    /// # Panics
+    /// If `len` exceeds [`capacity`](Self::capacity) (programmer error; the
+    /// pool only hands out buffers it checked).
+    pub(crate) fn set_len(&mut self, len: usize) {
+        assert!(
+            len <= self.capacity(),
+            "set_len({len}) exceeds the {}-byte allocation",
+            self.capacity()
+        );
+        self.len = len;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -194,6 +218,32 @@ impl GpuBuffer {
         (ptr.cast::<T>(), self.len / size)
     }
 }
+
+// SAFETY (audited, M5): `GpuBuffer` wraps a retained `MTLBuffer` plus a
+// plain `usize`. Sending or sharing it across threads is sound because:
+//
+// - Metal framework objects are documented thread-safe ("Metal and
+//   Threading": all objects except command *encoders* — which this type
+//   never holds — may be used from multiple threads), and ObjC
+//   retain/release is itself thread-safe; the missing auto-traits on
+//   `Retained<ProtocolObject<dyn MTLBuffer>>` are a bindings limitation,
+//   not a Metal one (the wgpu Metal backend relies on the same property).
+// - CPU-side aliasing of the shared-storage contents is governed entirely
+//   by the `&self`/`&mut self` borrow discipline of the accessors
+//   (`contents`/`as_slice` vs `contents_mut`/`as_mut_slice`), which the
+//   borrow checker enforces across threads exactly as on one thread.
+// - GPU-side hazards are governed by the `CommandBatch` borrow model
+//   (buffers a dispatch writes are held `&mut` until the synchronous
+//   `commit_and_wait` returns), which is thread-agnostic.
+//
+// This is what lets `Document` own GPU-backed tape/string buffers and stay
+// `Send + Sync`, and lets the parser's buffer pool be shared via
+// `Mutex<Vec<GpuBuffer>>` (drops, and therefore pool returns, can happen on
+// any thread).
+unsafe impl Send for GpuBuffer {}
+// SAFETY: see the `Send` audit above; `&GpuBuffer` only exposes read access
+// to the shared-storage contents.
+unsafe impl Sync for GpuBuffer {}
 
 impl std::fmt::Debug for GpuBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

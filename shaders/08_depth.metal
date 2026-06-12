@@ -85,11 +85,21 @@ kernel void depth_partials(
 // One threadgroup: in-place exclusive scan of the chunk weight sums — the
 // signed depth entering each chunk (the K2/K4/K7 spine shape, in long; a
 // 256-step serial ladder fold is noise for a spine kernel).
+//
+// Also zero-initializes `max_key` — the global max-sort-key word
+// `depth_apply` max-folds and the K8 sort passes consult to skip
+// all-zero-digit passes (09_sort.metal). This spine is the last dispatch
+// before `depth_apply` on the serial encoder, so the store is ordered
+// before every reader, and pooled-buffer reuse needs no CPU-side reset.
 kernel void depth_spine(
     device long* chunk_depth [[buffer(0)]],
-    constant MjParams& params [[buffer(1)]],
+    device uint* max_key [[buffer(1)]],
+    constant MjParams& params [[buffer(2)]],
     uint lid [[thread_position_in_threadgroup]])
 {
+    if (lid == 0u) {
+        max_key[0] = 0u;
+    }
     threadgroup long lanes[THREADGROUP_SIZE + 1];
 
     uint n = uint(params.element_count); // skeleton chunks
@@ -138,13 +148,20 @@ kernel void depth_spine(
 // bias per thread: a thread's 4-element weight sum is in [-4, +4], so
 // (sum + 4) is in [0, 8] and the scanned total stays tiny; subtracting
 // 4 * lid recovers the signed prefix.
+// As a by-product the kernel max-folds the CLAMPED sort key of every
+// stored depth into `max_key[0]` (per-simdgroup `simd_max`, then one
+// relaxed `atomic_fetch_max` per simdgroup). The K8 sort reads it to skip
+// passes whose digits are all zero. max is commutative and associative, so
+// the atomic fold is deterministic despite the scheduling order — the
+// single-writer rule everywhere else exists for order-SENSITIVE outputs.
 kernel void depth_apply(
     device const uchar* skel_byte [[buffer(0)]],
     device const uint* skel_pos [[buffer(1)]],
     device const long* chunk_depth [[buffer(2)]], // exclusive chunk carries
     device uint* depths [[buffer(3)]],
     device ulong* chunk_error [[buffer(4)]],
-    constant MjParams& params [[buffer(5)]],
+    device atomic_uint* max_key [[buffer(5)]],
+    constant MjParams& params [[buffer(6)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -170,29 +187,41 @@ kernel void depth_apply(
     long prefix = chunk_depth[tgid] + long(int(scanned) - 4 * int(lid));
 
     uint64_t err = MJ_HEADER_NO_ERROR;
+    uint key_seen = 0u;
+    uint key_max_clamp = mj_key_max(params.reserved0);
     for (uint j = 0u; j < MJ_SKEL_PER_THREAD; ++j) {
         ulong t = base + ulong(j);
         if (t < m) {
             uchar b = skel_byte[t];
             ulong pos = ulong(skel_pos[t]);
+            uint stored;
             if (mj_is_open_byte(b)) {
                 long d = prefix + 1;
                 if (d > max_depth) {
                     err = min(err, mj_pack_error(pos, MJ_ERR_DEPTH_LIMIT));
                 }
-                depths[t] = uint(max(d, 0l));
+                stored = uint(max(d, 0l));
             } else if (mj_is_close_byte(b)) {
                 if (prefix <= 0) {
                     // Close with nothing open (`1]`, `{}}`): the reference's
                     // close-below-root underflow, at the close's offset.
                     err = min(err, mj_pack_error(pos, MJ_ERR_UNBALANCED));
                 }
-                depths[t] = uint(max(prefix, 0l));
+                stored = uint(max(prefix, 0l));
             } else {
-                depths[t] = uint(max(prefix, 0l));
+                stored = uint(max(prefix, 0l));
             }
+            depths[t] = stored;
+            key_seen = max(key_seen, mj_sort_key(stored, key_max_clamp));
             prefix += long(w[j]);
         }
+    }
+
+    // Fold the max clamped key: simdgroup max, one relaxed atomic per
+    // simdgroup (see the kernel docs for why this stays deterministic).
+    uint simd_key = simd_max(key_seen);
+    if (simd_lane == 0u) {
+        atomic_fetch_max_explicit(max_key, simd_key, memory_order_relaxed);
     }
 
     lanes[lid] = err;

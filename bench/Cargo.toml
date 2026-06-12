@@ -4,7 +4,22 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Minimal stub so the workspace builds. The real benchmark harness
-# (criterion + vendored C++ simdjson via `cc`, Rust simd-json, serde_json)
-# lands in M5.
+# Benchmark harness: vendored C++ simdjson (FFI shim, see cpp/), Rust
+# simd-json, serde_json, and metal-json behind one criterion suite.
+# Datasets are discovered under <workspace>/data/bench (gitignored);
+# populate with `cargo run -p xtask -- fetch-data` / `gen-data`.
+
 [dependencies]
+metal-json = { path = "..", features = ["cpu-reference"] }
+
+[dev-dependencies]
+criterion = "0.8"
+serde_json = "1"
+simd-json = "0.17"
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }
+
+[[bench]]
+name = "compare"
+harness = false

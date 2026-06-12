@@ -68,6 +68,14 @@ use objc2_metal::{
 use super::{Dispatch, GpuBuffer, MetalContext, MjParams, Pipeline, THREADGROUP_SIZE};
 use crate::error::{Error, Result};
 
+/// Whether `METAL_JSON_SPLIT_KERNELS=1` put batches into the
+/// measurement-only one-command-buffer-per-dispatch mode (checked once).
+#[cfg(feature = "timing")]
+fn split_kernels_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("METAL_JSON_SPLIT_KERNELS").is_some_and(|v| v == "1"))
+}
+
 /// Handle to a buffer registered with [`CommandBatch::bind_read`] /
 /// [`CommandBatch::bind_write`]: an index into that batch's resource table.
 ///
@@ -240,6 +248,37 @@ impl<'env> CommandBatch<'env> {
                     .dispatchThreadgroups_threadsPerThreadgroup(grid(n), per_group);
             }
         }
+
+        #[cfg(feature = "timing")]
+        if split_kernels_enabled() {
+            self.split_after_dispatch(pipeline.name());
+        }
+    }
+
+    /// Measurement-only (`METAL_JSON_SPLIT_KERNELS=1` + the `timing`
+    /// feature): cut the command buffer right after a dispatch — end the
+    /// encoder, commit, wait, record the kernel's GPU execution time — and
+    /// start a fresh command buffer + encoder for the batch's remaining
+    /// dispatches. Each dispatch binds its PSO/buffers itself, so a fresh
+    /// encoder needs no rebinding. Serial-encoder ordering is preserved
+    /// (the wait is a stronger barrier); only wall time inflates (one sync
+    /// per kernel), which the per-phase gap columns expose separately.
+    #[cfg(feature = "timing")]
+    fn split_after_dispatch(&mut self, kernel: &str) {
+        self.encoder.endEncoding();
+        self.cmd_buf.commit();
+        self.cmd_buf.waitUntilCompleted();
+        let gpu = (self.cmd_buf.GPUEndTime() - self.cmd_buf.GPUStartTime()).max(0.0);
+        crate::gpu::timing::record_kernel(kernel, gpu);
+        self.cmd_buf = self
+            .ctx
+            .queue()
+            .commandBuffer()
+            .expect("split-kernel mode: fresh command buffer");
+        self.encoder = self
+            .cmd_buf
+            .computeCommandEncoder()
+            .expect("split-kernel mode: fresh compute encoder");
     }
 
     /// End encoding, commit, block until the GPU finishes, and surface any

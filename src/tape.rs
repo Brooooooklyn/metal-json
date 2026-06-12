@@ -37,6 +37,10 @@
 //! - `t` / `f` / `n` literals: one word, payload 0.
 
 use core::ops::Deref;
+use std::sync::Arc;
+
+use crate::metal::GpuBuffer;
+use crate::pool::ScratchPool;
 
 // ---------------------------------------------------------------------------
 // Layout constants (mirrored in shaders/tape_types.h — keep in lock-step)
@@ -298,49 +302,124 @@ pub const fn double_from_bits(word: u64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Pooled GPU storage (shared by TapeBuffer and StringBuffer)
+// ---------------------------------------------------------------------------
+
+/// A finished, GPU-written buffer owned by a `Document`: the shared-storage
+/// [`GpuBuffer`] plus the [`ScratchPool`] handle it returns to on drop.
+///
+/// The pool handle is an `Arc`, so the buffer can never be returned — let
+/// alone reused by a later parse — while this storage (and therefore the
+/// `Document` that owns it) is alive; the pool itself outlives its parser
+/// for the same reason. Read access is plain shared-memory slicing (Apple
+/// unified memory): zero copy, the M5 `Document` contract.
+#[derive(Debug)]
+pub(crate) struct PooledGpuBytes {
+    /// `Some` until drop (taken exactly once, to return it to the pool).
+    buf: Option<GpuBuffer>,
+    pool: Arc<ScratchPool>,
+}
+
+impl PooledGpuBytes {
+    pub(crate) fn new(buf: GpuBuffer, pool: Arc<ScratchPool>) -> Self {
+        Self {
+            buf: Some(buf),
+            pool,
+        }
+    }
+
+    fn buffer(&self) -> &GpuBuffer {
+        self.buf.as_ref().expect("buffer present until drop")
+    }
+}
+
+impl Drop for PooledGpuBytes {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.put_back(buf);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TapeBuffer
 // ---------------------------------------------------------------------------
 
+/// Where a [`TapeBuffer`]'s words live. The enum is private: reading goes
+/// through `Deref<Target = [u64]>`, building through the `Vec`-backed
+/// mutators, so the storage swap (the design goal since M1) is invisible.
+enum TapeStorage {
+    /// CPU-built words (the reference backend, hand-built test tapes).
+    Vec(Vec<u64>),
+    /// A finished GPU tape, read in place (zero copy).
+    Gpu(PooledGpuBytes),
+}
+
 /// Owns the tape words.
 ///
-/// M1 stores a plain `Vec<u64>`. From M2 on, the words may instead live in a
-/// shared-storage [`GpuBuffer`](crate::metal::GpuBuffer) written by the GPU
-/// pipeline; the storage is therefore fully encapsulated — reading goes
-/// through `Deref<Target = [u64]>` and building through
-/// [`push`](Self::push)/[`set`](Self::set), so swapping the backing store is
-/// not an API change.
-#[derive(Clone, Default)]
+/// Two backings, fully encapsulated: a plain `Vec<u64>` (the M1
+/// reference-backend builder) or — since M5 — the shared-storage
+/// [`GpuBuffer`] the GPU pipeline wrote, read in place with zero copy.
+/// Reading goes through `Deref<Target = [u64]>`; the builder API
+/// ([`push`](Self::push)/[`set`](Self::set)/[`clear`](Self::clear)) is
+/// `Vec`-backed only — GPU tapes are finished artifacts and immutable
+/// (those methods panic on a GPU-backed tape; nothing in the crate calls
+/// them on one).
+#[derive(Default)]
 pub struct TapeBuffer {
-    words: Vec<u64>,
+    storage: TapeStorage,
+}
+
+impl Default for TapeStorage {
+    fn default() -> Self {
+        Self::Vec(Vec::new())
+    }
 }
 
 impl TapeBuffer {
     /// Empty tape.
     #[must_use]
     pub const fn new() -> Self {
-        Self { words: Vec::new() }
+        Self {
+            storage: TapeStorage::Vec(Vec::new()),
+        }
     }
 
     /// Empty tape with room for `capacity` words.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            words: Vec::with_capacity(capacity),
+            storage: TapeStorage::Vec(Vec::with_capacity(capacity)),
         }
     }
 
-    /// A tape over already-finished words (the GPU backend's copy-out path;
-    /// `words` must be a complete tape-format-v1 encoding). M5 TODO: a
-    /// zero-copy variant over the shared `GpuBuffer` replaces this copy.
-    pub(crate) fn from_words(words: Vec<u64>) -> Self {
-        Self { words }
+    /// Zero-copy: a tape over the finished GPU buffer (a complete
+    /// tape-format-v1 encoding written by the pipeline; `buf.len()` must be
+    /// a multiple of 8). Returns to `pool` on drop.
+    pub(crate) fn from_gpu(buf: GpuBuffer, pool: Arc<ScratchPool>) -> Self {
+        Self {
+            storage: TapeStorage::Gpu(PooledGpuBytes::new(buf, pool)),
+        }
+    }
+
+    fn vec_mut(&mut self, op: &str) -> &mut Vec<u64> {
+        match &mut self.storage {
+            TapeStorage::Vec(words) => words,
+            TapeStorage::Gpu(_) => {
+                panic!("TapeBuffer::{op}: GPU-backed tapes are finished artifacts (immutable)")
+            }
+        }
     }
 
     /// Append a word, returning its tape index.
+    ///
+    /// # Panics
+    /// On a GPU-backed tape (the builder API is `Vec`-backed only).
     #[inline]
     pub fn push(&mut self, word: u64) -> usize {
-        let index = self.words.len();
-        self.words.push(word);
+        let words = self.vec_mut("push");
+        let index = words.len();
+        words.push(word);
         index
     }
 
@@ -348,10 +427,10 @@ impl TapeBuffer {
     /// matching close index and child count are known).
     ///
     /// # Panics
-    /// If `index` is out of bounds.
+    /// If `index` is out of bounds, or on a GPU-backed tape.
     #[inline]
     pub fn set(&mut self, index: usize, word: u64) {
-        self.words[index] = word;
+        self.vec_mut("set")[index] = word;
     }
 
     /// The tape words. Equivalent to the `Deref` view; handy where deref
@@ -359,12 +438,15 @@ impl TapeBuffer {
     #[inline]
     #[must_use]
     pub fn as_words(&self) -> &[u64] {
-        &self.words
+        self
     }
 
     /// Remove all words, keeping the allocation.
+    ///
+    /// # Panics
+    /// On a GPU-backed tape.
     pub fn clear(&mut self) {
-        self.words.clear();
+        self.vec_mut("clear").clear();
     }
 }
 
@@ -373,14 +455,34 @@ impl Deref for TapeBuffer {
 
     #[inline]
     fn deref(&self) -> &[u64] {
-        &self.words
+        match &self.storage {
+            TapeStorage::Vec(words) => words,
+            TapeStorage::Gpu(gpu) => gpu.buffer().as_slice::<u64>(),
+        }
+    }
+}
+
+impl Clone for TapeBuffer {
+    /// Cloning materializes a `Vec`-backed copy (a GPU-backed original
+    /// keeps its buffer; the clone owns plain memory).
+    fn clone(&self) -> Self {
+        Self {
+            storage: TapeStorage::Vec(self.as_words().to_vec()),
+        }
     }
 }
 
 impl std::fmt::Debug for TapeBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TapeBuffer")
-            .field("len", &self.words.len())
+            .field("len", &self.len())
+            .field(
+                "storage",
+                &match &self.storage {
+                    TapeStorage::Vec(_) => "vec",
+                    TapeStorage::Gpu(_) => "gpu",
+                },
+            )
             .finish()
     }
 }
@@ -405,33 +507,70 @@ impl std::fmt::Debug for TapeBuffer {
 ///   [`pad_to`](Self::pad_to) place records at offsets allocated by the
 ///   pipeline's raw-length prefix sum (see `docs/tape-format.md`), where
 ///   escapes that shrink a string leave a **gap** before the next record.
-///   The reference backend zero-fills gaps deterministically.
-#[derive(Clone, Default)]
+///   The reference backend zero-fills gaps deterministically; on the GPU
+///   backend gap bytes are contractually unspecified.
+///
+/// Like [`TapeBuffer`], the backing store is either a `Vec<u8>` (the
+/// reference builder; the record-appending mutators are `Vec`-backed only
+/// and panic on a GPU-backed buffer) or — since M5 — the shared-storage
+/// GPU buffer read in place, zero copy.
+#[derive(Default)]
 pub struct StringBuffer {
-    bytes: Vec<u8>,
+    storage: StringStorage,
+}
+
+/// See [`TapeStorage`].
+enum StringStorage {
+    Vec(Vec<u8>),
+    Gpu(PooledGpuBytes),
+}
+
+impl Default for StringStorage {
+    fn default() -> Self {
+        Self::Vec(Vec::new())
+    }
 }
 
 impl StringBuffer {
     /// Empty string buffer.
     #[must_use]
     pub const fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            storage: StringStorage::Vec(Vec::new()),
+        }
     }
 
     /// Empty string buffer with room for `capacity` bytes.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(capacity),
+            storage: StringStorage::Vec(Vec::with_capacity(capacity)),
         }
     }
 
-    /// A string buffer over already-finished record bytes (the GPU
-    /// backend's copy-out path; `bytes` must hold `[u32 LE len][content]
-    /// [NUL]` records at the offsets the tape's `"` words carry). M5 TODO:
-    /// a zero-copy variant over the shared `GpuBuffer` replaces this copy.
-    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+    /// Zero-copy: a string buffer over the finished GPU buffer (must hold
+    /// `[u32 LE len][content][NUL]` records at the offsets the tape's `"`
+    /// words carry). Returns to `pool` on drop.
+    pub(crate) fn from_gpu(buf: GpuBuffer, pool: Arc<ScratchPool>) -> Self {
+        Self {
+            storage: StringStorage::Gpu(PooledGpuBytes::new(buf, pool)),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match &self.storage {
+            StringStorage::Vec(bytes) => bytes,
+            StringStorage::Gpu(gpu) => gpu.buffer().contents(),
+        }
+    }
+
+    fn vec_mut(&mut self, op: &str) -> &mut Vec<u8> {
+        match &mut self.storage {
+            StringStorage::Vec(bytes) => bytes,
+            StringStorage::Gpu(_) => panic!(
+                "StringBuffer::{op}: GPU-backed string buffers are finished artifacts (immutable)"
+            ),
+        }
     }
 
     /// Append a `[u32 LE length][content][NUL]` record and return the byte
@@ -441,19 +580,20 @@ impl StringBuffer {
     ///
     /// # Panics
     /// If `content` is longer than `u32::MAX` bytes or the record would push
-    /// an offset past 56 bits (both far beyond supported input sizes).
+    /// an offset past 56 bits (both far beyond supported input sizes), or
+    /// on a GPU-backed buffer (the builder API is `Vec`-backed only).
     pub fn append_record(&mut self, content: &[u8]) -> u64 {
         let len = u32::try_from(content.len()).expect("string longer than u32::MAX bytes");
-        let offset = self.bytes.len() as u64;
+        let bytes = self.vec_mut("append_record");
+        let offset = bytes.len() as u64;
         assert!(
             offset <= STRING_OFFSET_MASK,
             "string buffer offset exceeds 56 bits"
         );
-        self.bytes
-            .reserve(STRING_RECORD_HEADER_BYTES + content.len() + STRING_RECORD_TRAILER_BYTES);
-        self.bytes.extend_from_slice(&len.to_le_bytes());
-        self.bytes.extend_from_slice(content);
-        self.bytes.push(0);
+        bytes.reserve(STRING_RECORD_HEADER_BYTES + content.len() + STRING_RECORD_TRAILER_BYTES);
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(content);
+        bytes.push(0);
         offset
     }
 
@@ -468,15 +608,17 @@ impl StringBuffer {
     ///
     /// # Panics
     /// If `offset` is smaller than the current length (records are placed in
-    /// document order; padding never moves backwards).
+    /// document order; padding never moves backwards), or on a GPU-backed
+    /// buffer.
     pub fn pad_to(&mut self, offset: u64) {
         let target = usize::try_from(offset).expect("string offset exceeds usize");
+        let bytes = self.vec_mut("pad_to");
         assert!(
-            target >= self.bytes.len(),
+            target >= bytes.len(),
             "pad_to({target}) would shrink the buffer (len {})",
-            self.bytes.len()
+            bytes.len()
         );
-        self.bytes.resize(target, 0);
+        bytes.resize(target, 0);
     }
 
     /// Append a `[u32 LE length][content][NUL]` record **at** byte `offset`,
@@ -504,14 +646,15 @@ impl StringBuffer {
     /// offsets must come from this buffer's tape).
     #[must_use]
     pub fn record_bytes(&self, offset: u64) -> &[u8] {
+        let bytes = self.bytes();
         let start = usize::try_from(offset).expect("string offset exceeds usize");
-        let header: [u8; STRING_RECORD_HEADER_BYTES] = self.bytes
+        let header: [u8; STRING_RECORD_HEADER_BYTES] = bytes
             [start..start + STRING_RECORD_HEADER_BYTES]
             .try_into()
             .expect("string record header out of bounds");
         let len = u32::from_le_bytes(header) as usize;
         let content_start = start + STRING_RECORD_HEADER_BYTES;
-        &self.bytes[content_start..content_start + len]
+        &bytes[content_start..content_start + len]
     }
 
     /// Content of the record at `offset` as `&str`.
@@ -529,33 +672,53 @@ impl StringBuffer {
     /// Total bytes in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.bytes().len()
     }
 
     /// True if no records have been appended.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.bytes().is_empty()
     }
 
-    /// Raw buffer contents (records in document order, with zero-filled
-    /// gaps wherever the offset scheme left room — see
-    /// [`append_record_at`](Self::append_record_at)).
+    /// Raw buffer contents: records in document order. Gap bytes (where the
+    /// offset scheme left room) are zero-filled on the reference backend
+    /// and **unspecified** on the GPU backend — compare records (see
+    /// [`record_bytes`](Self::record_bytes)), never raw gaps.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes()
     }
 
     /// Remove all records, keeping the allocation.
+    ///
+    /// # Panics
+    /// On a GPU-backed buffer.
     pub fn clear(&mut self) {
-        self.bytes.clear();
+        self.vec_mut("clear").clear();
+    }
+}
+
+impl Clone for StringBuffer {
+    /// Cloning materializes a `Vec`-backed copy (see [`TapeBuffer`]).
+    fn clone(&self) -> Self {
+        Self {
+            storage: StringStorage::Vec(self.bytes().to_vec()),
+        }
     }
 }
 
 impl std::fmt::Debug for StringBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StringBuffer")
-            .field("len", &self.bytes.len())
+            .field("len", &self.len())
+            .field(
+                "storage",
+                &match &self.storage {
+                    StringStorage::Vec(_) => "vec",
+                    StringStorage::Gpu(_) => "gpu",
+                },
+            )
             .finish()
     }
 }

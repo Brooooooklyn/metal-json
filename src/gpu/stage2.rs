@@ -54,6 +54,7 @@
 
 use crate::error::{Error, Result};
 use crate::metal::{Dispatch, MetalContext, MjHeader, MjParams, THREADGROUP_SIZE};
+use crate::pool::Alloc;
 use crate::stage::{Stage, Stage1Buffers, Stage2Buffers};
 
 use super::stage1::{Stage1, Stage1Output};
@@ -147,12 +148,30 @@ impl Stage2Output {
     }
 
     /// A rejected output: `stage1` as given, everything else empty.
-    fn rejected(stage1: Stage1Output, packed_error: u64) -> Self {
+    pub(crate) fn rejected(stage1: Stage1Output, packed_error: u64) -> Self {
         Self {
             stage1,
             error: Some(packed_error),
             ..Self::default()
         }
+    }
+
+    /// Rebuild the test-facing rejected output from the live buffers — the
+    /// readback the lean [`Stage2::run_to_lists`] skips on the production
+    /// path. Stage-1 rejections apply [`Stage1Output`]'s rejection contract
+    /// (token outputs reported empty); `EmptyInput` / Layer-1 rejections
+    /// keep whatever token outputs stage 1 produced.
+    pub(crate) fn from_rejection(
+        bufs1: &Stage1Buffers,
+        rejection: &Stage2Rejection,
+    ) -> Self {
+        let header = bufs1.read_header();
+        let stage1 = Stage1Output::snapshot(
+            bufs1,
+            &header,
+            rejection.stage1_error.then_some(rejection.packed),
+        );
+        Self::rejected(stage1, rejection.packed)
     }
 }
 
@@ -206,15 +225,17 @@ impl Stage2 {
         ctx: &MetalContext,
         bufs1: &mut Stage1Buffers,
     ) -> Result<Stage2Output> {
-        match self.run_to_lists(ctx, bufs1)? {
-            Stage2Run::Rejected(out) => Ok(*out),
+        match self.run_to_lists(ctx, Alloc::Direct, bufs1)? {
+            Stage2Run::Rejected(rejection) => {
+                Ok(Stage2Output::from_rejection(bufs1, &rejection))
+            }
             Stage2Run::Accepted(run) => {
                 let Stage2Accepted {
-                    stage1,
                     bufs2,
                     header,
                     gpu_seconds: _,
                 } = *run;
+                let stage1 = Stage1Output::snapshot(bufs1, &header, None);
                 Ok(Self::collect_outputs(stage1, &bufs2, &header))
             }
         }
@@ -222,7 +243,15 @@ impl Stage2 {
 
     /// Run the pipeline through CB2b (the lists exist on success) WITHOUT
     /// the test-oriented `Vec` readback, so the CB3 orchestration
-    /// (`crate::gpu::stage3`) can keep using the GPU buffers directly.
+    /// (`crate::gpu::stage3` / `crate::gpu::pipeline`) can keep using the
+    /// GPU buffers directly. Rejections are equally lean — a packed verdict
+    /// plus which phase rejected; the test runners rebuild the full
+    /// [`Stage2Output`] via [`Stage2Output::from_rejection`], the
+    /// production path returns the verdict as-is (the M5 fix for the
+    /// snapshot copy that used to ride along every large parse).
+    ///
+    /// `alloc` is where the token / stage-2 buffers come from (the
+    /// production path passes the parser's pool).
     ///
     /// # Errors
     ///
@@ -230,6 +259,7 @@ impl Stage2 {
     pub(crate) fn run_to_lists(
         &self,
         ctx: &MetalContext,
+        alloc: Alloc<'_>,
         bufs1: &mut Stage1Buffers,
     ) -> Result<Stage2Run> {
         let input_len = bufs1.input_len();
@@ -237,10 +267,7 @@ impl Stage2 {
         if bufs1.words() == 0 {
             // Zero-byte input: no tokens, nothing to dispatch — the
             // reference's EmptyInput verdict at offset 0.
-            return Ok(Stage2Run::rejected(Stage2Output::rejected(
-                Stage1Output::default(),
-                u64::from(ERR_EMPTY_INPUT),
-            )));
+            return Ok(Stage2Run::rejected(u64::from(ERR_EMPTY_INPUT), false));
         }
 
         // The stage-2 cooperative kernels are written for full 256-thread
@@ -255,15 +282,17 @@ impl Stage2 {
         }
 
         // --- CB1, then CPU sync 1 ------------------------------------------
+        let t = super::timing::start();
         let mut gpu_seconds = self.stage1.run_cb1(ctx, bufs1)?;
+        super::timing::record("cb1 (K1-K4)", t, gpu_seconds);
+        let t = super::timing::start();
         let header = bufs1.read_header();
 
         if let Some((offset, code)) = header.first_error() {
             // Stage-1 rejection (UTF-8 / odd quotes) carried forward: CB2
             // never runs (M2 contract).
             let packed = (offset << 32) | u64::from(code);
-            let stage1 = Stage1Output::snapshot(bufs1, &header, Some(packed));
-            return Ok(Stage2Run::rejected(Stage2Output::rejected(stage1, packed)));
+            return Ok(Stage2Run::rejected(packed, true));
         }
 
         let token_total = usize::try_from(header.token_total).expect("token_total fits usize");
@@ -278,14 +307,10 @@ impl Stage2 {
         if token_total == 0 {
             // Whitespace-only input: the reference's EmptyInput verdict at
             // offset 0. CPU-side — there are no tokens to dispatch K6 over.
-            let stage1 = Stage1Output::snapshot(bufs1, &header, None);
-            return Ok(Stage2Run::rejected(Stage2Output::rejected(
-                stage1,
-                u64::from(ERR_EMPTY_INPUT),
-            )));
+            return Ok(Stage2Run::rejected(u64::from(ERR_EMPTY_INPUT), false));
         }
-        bufs1.alloc_tokens(ctx, token_total)?;
-        let mut bufs2 = Stage2Buffers::new(ctx, token_total)?;
+        bufs1.alloc_tokens_in(ctx, alloc, token_total)?;
+        let mut bufs2 = Stage2Buffers::new_in(ctx, alloc, token_total)?;
         let tok_chunks = bufs2.chunks();
         let word_chunks = bufs1.chunks();
 
@@ -304,8 +329,10 @@ impl Stage2 {
             element_count: tok_chunks as u64,
             ..Default::default()
         };
+        super::timing::record("sync1: header + token/scratch alloc", t, 0.0);
 
         // --- CB2: K5 → K6 → K7, one commit, one wait ------------------------
+        let t = super::timing::start();
         {
             let mut batch = ctx.batch()?;
             let h_input = batch.bind_read(&bufs1.input);
@@ -338,25 +365,33 @@ impl Stage2 {
                 Some(&tok_chunk_params),
                 Dispatch::Threadgroups(1),
             )?;
-            gpu_seconds += batch.commit_and_wait_timed()?;
+            let cb2_gpu = batch.commit_and_wait_timed()?;
+            gpu_seconds += cb2_gpu;
+            super::timing::record("cb2 (K5-K7)", t, cb2_gpu);
         }
 
         // --- CB2 → CPU sync 2 ------------------------------------------------
+        let t = super::timing::start();
         let header = bufs1.read_header();
-        let stage1 = Stage1Output::snapshot(bufs1, &header, None);
+        super::timing::record("sync2: header read", t, 0.0);
 
         if let Some((offset, code)) = header.first_error() {
             // Layer-1 rejection: K6b (and CB3) never run; the list outputs
             // are never produced. Stage 1 accepted the input, so its token
-            // outputs are kept (see Stage2Output's rejection contract).
+            // outputs are kept (see Stage2Output's rejection contract). The
+            // stage-2 scratch goes straight back to the pool.
             let packed = (offset << 32) | u64::from(code);
-            return Ok(Stage2Run::rejected(Stage2Output::rejected(stage1, packed)));
+            if let Alloc::Pool(pool) = alloc {
+                bufs2.recycle(pool);
+            }
+            return Ok(Stage2Run::rejected(packed, false));
         }
 
         let totals = ListTotals::checked(&header, token_total)?;
 
         // --- exact-size list allocation + CB2b: K6b --------------------------
-        bufs2.alloc_lists(ctx, totals.skeleton, totals.strings, totals.scalars)?;
+        let t = super::timing::start();
+        bufs2.alloc_lists_in(ctx, alloc, totals.skeleton, totals.strings, totals.scalars)?;
         {
             let mut batch = ctx.batch()?;
             let h_input = batch.bind_read(&bufs1.input);
@@ -378,11 +413,12 @@ impl Stage2 {
                 Some(&token_params),
                 Dispatch::Threadgroups(tok_chunks),
             )?;
-            gpu_seconds += batch.commit_and_wait_timed()?;
+            let cb2b_gpu = batch.commit_and_wait_timed()?;
+            gpu_seconds += cb2b_gpu;
+            super::timing::record("cb2b (K6b) + list alloc", t, cb2b_gpu);
         }
 
         Ok(Stage2Run::Accepted(Box::new(Stage2Accepted {
-            stage1,
             bufs2,
             header,
             gpu_seconds,
@@ -416,29 +452,43 @@ impl Stage2 {
     }
 }
 
-/// Where a stage-2 run ended. Internal: lets the CB3 orchestration
-/// (`crate::gpu::stage3`) continue from `Accepted` with live GPU buffers
-/// instead of forcing [`Stage2Output`]'s readback.
+/// Where a stage-2 run ended. Internal: lets the CB3 orchestrations
+/// (`crate::gpu::stage3`, `crate::gpu::pipeline`) continue from `Accepted`
+/// with live GPU buffers instead of forcing [`Stage2Output`]'s readback.
 pub(crate) enum Stage2Run {
     /// The pipeline rejected the input (stage-1 error, `EmptyInput`, or a
-    /// Layer-1 error): the finished output with its rejection contract
-    /// applied. Boxed to keep the enum small.
-    Rejected(Box<Stage2Output>),
+    /// Layer-1 error). Lean by design: only the packed verdict plus which
+    /// phase rejected; test runners rebuild a full [`Stage2Output`] via
+    /// [`Stage2Output::from_rejection`].
+    Rejected(Stage2Rejection),
     /// Layer 1 passed: K6b ran and the skeleton / list buffers exist.
     Accepted(Box<Stage2Accepted>),
 }
 
 impl Stage2Run {
-    fn rejected(out: Stage2Output) -> Self {
-        Self::Rejected(Box::new(out))
+    fn rejected(packed: u64, stage1_error: bool) -> Self {
+        Self::Rejected(Stage2Rejection {
+            packed,
+            stage1_error,
+        })
     }
 }
 
-/// The accepted half of [`Stage2Run`]: everything CB3 needs.
+/// The rejected half of [`Stage2Run`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Stage2Rejection {
+    /// The packed `(byte_offset << 32) | code` verdict.
+    pub(crate) packed: u64,
+    /// True when CB1 itself rejected (UTF-8 / odd quotes), which applies
+    /// [`Stage1Output`]'s rejection contract (no token outputs). False for
+    /// `EmptyInput` and Layer-1 (K6) rejections.
+    pub(crate) stage1_error: bool,
+}
+
+/// The accepted half of [`Stage2Run`]: everything CB3 needs. The stage-1
+/// view is **not** snapshotted here (the M5 lean path); test runners that
+/// want it call [`Stage1Output::snapshot`] on their own buffers.
 pub(crate) struct Stage2Accepted {
-    /// The stage-1 view (bitmaps, token stream, totals), already
-    /// snapshotted at the CPU sync 2.
-    pub(crate) stage1: Stage1Output,
     /// The CB2 buffers, lists allocated and written.
     pub(crate) bufs2: Stage2Buffers,
     /// The header as read at the CPU sync 2 (totals valid, no error).

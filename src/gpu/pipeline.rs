@@ -74,22 +74,37 @@
 //! unobserved. `decode_packed_error` maps the packed word to the public
 //! [`Error`] enum (a completeness test pins every `MJ_ERR_*` code).
 //!
-//! # M5 perf notes (correctness-first deviations, all flagged)
+//! # M5 perf contract (the former correctness-first deviations, resolved)
 //!
-//! - The tape and string buffers are zero-filled after allocation. Accepted
-//!   runs overwrite every tape word, so the tape fill is pure defense; the
-//!   string fill makes the (contractually unspecified) gap bytes
-//!   deterministic and reference-equal. Both fills are droppable.
-//! - `Stage2::run_to_lists` snapshots the stage-1 view into `Vec`s for the
-//!   test runners; the pipeline pays that copy too. A lean variant can
-//!   skip it.
-//! - The parser copies the finished tape/string buffers into
+//! - **No zero fills.** The tape buffer is *not* zero-filled: on accepted
+//!   inputs every word is written by exactly one producer (containers/roots
+//!   by K12/K13 or the CPU root write, numbers/literals by K10, strings by
+//!   K11 — each token's footprint words belong to exactly one kernel), and
+//!   rejected runs never observe the tape. The string buffer is not
+//!   zero-filled either: gap bytes (escape-shrunk slots) are contractually
+//!   **unspecified** — with pooled buffers they are whatever the previous
+//!   parse left (the pinned gap policy; consumers compare records, never
+//!   raw gaps). The pool-poison tests in `tests/gpu_e2e.rs` pin both.
+//! - **No stage-1 snapshot.** `Stage2::run_to_lists` is lean: accepted runs
+//!   hand over live GPU buffers, rejected runs a packed verdict; the
+//!   test-runner `Vec` readbacks are rebuilt on demand outside this path.
+//! - **Zero-copy `Document`.** [`GpuParseOutput`] hands the tape / string
+//!   `GpuBuffer`s to the parser, which wraps them into GPU-backed
 //!   [`TapeBuffer`](crate::tape::TapeBuffer) /
-//!   [`StringBuffer`](crate::tape::StringBuffer); zero-copy `Document`s
-//!   over the shared `GpuBuffer`s are the M5 plan.
+//!   [`StringBuffer`](crate::tape::StringBuffer) storage — no copy-out.
+//! - **Pooled scratch.** [`GpuPipeline::run_pooled`] checks every buffer
+//!   out of a [`ScratchPool`] and recycles the scratch before returning
+//!   (the tape/string buffers return when the `Document` drops). Steady
+//!   state does zero large allocations. All zero/init preconditions are
+//!   explicit fills (`Stage1Buffers` chunk counts + header, the K10/K11
+//!   counters below) — pooled contents are garbage by contract.
+//! - **Zero-copy input.** [`GpuInput::External`] wraps caller-held
+//!   page-aligned memory (`bytesNoCopy`); [`GpuInput::Bytes`] copies once
+//!   into a pooled buffer.
 
 use crate::error::{Error, Result, SyntaxErrorKind};
 use crate::metal::{Dispatch, GpuBuffer, MetalContext, MjParams, THREADGROUP_SIZE};
+use crate::pool::{Alloc, ScratchPool};
 use crate::stage::{Stage, Stage1Buffers, Stage3Buffers, sort_passes};
 use crate::tape::{make_final_root, make_root};
 
@@ -107,6 +122,31 @@ use super::{
 /// that no kernel produces. Mapped (to a generic `UnexpectedToken`) so the
 /// error decoding is total over the `MjErrorCode` space.
 const ERR_SYNTAX_RESERVED: u32 = 2;
+
+/// How the input reaches the GPU.
+///
+/// Internal/unstable (exposed for the integration tests, like the rest of
+/// [`crate::gpu`]); the supported surface is `Parser::parse` /
+/// `Parser::parse_aligned` / `Parser::parse_file`.
+#[derive(Debug)]
+pub enum GpuInput<'a> {
+    /// Plain bytes: copied **once** into a pooled, space-padded GPU buffer
+    /// (the only copy on this path).
+    Bytes(&'a [u8]),
+    /// A caller-prepared zero-copy buffer (already wrapped via
+    /// [`GpuBuffer::from_page_aligned`], typically over an
+    /// [`AlignedInput`](crate::AlignedInput) or an mmap). `len` is the
+    /// document length; the wrapped memory must satisfy
+    /// `from_page_aligned`'s contract for the duration of the parse, plus
+    /// the stage-1 padding invariant: bytes `len..len.next_multiple_of(64)`
+    /// are ASCII spaces.
+    External {
+        /// The `bytesNoCopy` buffer over the caller's pages.
+        buffer: GpuBuffer,
+        /// Document length in bytes.
+        len: usize,
+    },
+}
 
 /// Where a full GPU parse ended.
 #[derive(Debug)]
@@ -129,8 +169,9 @@ pub struct GpuParseOutput {
     pub tape: GpuBuffer,
     /// The string buffer (`[u32 LE len][content][NUL]` records at the
     /// raw-length prefix-sum offsets); `None` when the document has no
-    /// strings (`stringbuf_total == 0`). Gap bytes are zero-filled today
-    /// (see the module's M5 notes) but contractually unspecified.
+    /// strings (`stringbuf_total == 0`). Gap bytes (escape-shrunk slots)
+    /// are contractually **unspecified** — with pooled buffers they are
+    /// whatever the previous parse left there.
     pub stringbuf: Option<GpuBuffer>,
     /// Token indices that took the K10 hard-case fixup path, sorted
     /// ascending (diagnostic; the value words are already patched).
@@ -188,9 +229,12 @@ impl GpuPipeline {
         }
     }
 
-    /// Run the full pipeline over `input`: CB1 → CB2 → CB2b → CB3
-    /// (structure + K10 + K11) → fixup patch. See the module docs for the
-    /// command-buffer shape and the error/rejection contracts.
+    /// Run the full pipeline over `input` with a throwaway buffer pool:
+    /// CB1 → CB2 → CB2b → CB3 (structure + K10 + K11) → fixup patch. See
+    /// the module docs for the command-buffer shape and the
+    /// error/rejection contracts. Tests and one-shot callers use this;
+    /// the parser drives [`run_pooled`](Self::run_pooled) with its
+    /// long-lived pool.
     ///
     /// # Errors
     ///
@@ -198,23 +242,73 @@ impl GpuPipeline {
     /// [`Error::BufferAlloc`], pipeline/command-buffer errors). Input
     /// *content* problems are **data**: [`GpuParse::Rejected`].
     pub fn run(&self, ctx: &MetalContext, input: &[u8], max_depth: u32) -> Result<GpuParse> {
-        let mut bufs1 = Stage1Buffers::new(ctx, input)?;
+        self.run_pooled(ctx, &ScratchPool::new(), GpuInput::Bytes(input), max_depth)
+    }
 
+    /// [`run`](Self::run) over an explicit [`ScratchPool`] and input
+    /// source. Every buffer is checked out of `pool`; the scratch returns
+    /// to it before this call finishes, the finished tape/string buffers
+    /// return when their owner (the parser's `Document`) drops them back.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub fn run_pooled(
+        &self,
+        ctx: &MetalContext,
+        pool: &ScratchPool,
+        input: GpuInput<'_>,
+        max_depth: u32,
+    ) -> Result<GpuParse> {
+        super::timing::begin_parse();
+        let alloc = Alloc::Pool(pool);
+        let t = super::timing::start();
+        let mut bufs1 = match input {
+            GpuInput::Bytes(bytes) => {
+                let bufs = Stage1Buffers::new_in(ctx, alloc, bytes)?;
+                super::timing::record("stage1 alloc + input copy", t, 0.0);
+                bufs
+            }
+            GpuInput::External { buffer, len } => {
+                let bufs = Stage1Buffers::with_external_input(ctx, alloc, buffer, len)?;
+                super::timing::record("stage1 alloc (zero-copy input)", t, 0.0);
+                bufs
+            }
+        };
+
+        let result = self.drive(ctx, pool, &mut bufs1, max_depth);
+
+        let t = super::timing::start();
+        bufs1.recycle(pool);
+        super::timing::record("scratch recycle (stage1)", t, 0.0);
+        result
+    }
+
+    /// The pipeline body over prepared stage-1 buffers (which the caller
+    /// recycles). Internally checks all further scratch out of `pool` and
+    /// returns it before finishing — on every rejection path too; only the
+    /// rare `?` plumbing errors let buffers drop-free instead.
+    fn drive(
+        &self,
+        ctx: &MetalContext,
+        pool: &ScratchPool,
+        bufs1: &mut Stage1Buffers,
+        max_depth: u32,
+    ) -> Result<GpuParse> {
+        let alloc = Alloc::Pool(pool);
         // --- CB1 → CB2 → CB2b (stage 2 owns the first two syncs) -----------
         let Stage2Accepted {
-            stage1: _, // M5 TODO: skip this test-oriented snapshot copy
             bufs2,
             header,
             gpu_seconds: _,
-        } = match self.stage3.stage2().run_to_lists(ctx, &mut bufs1)? {
-            Stage2Run::Rejected(out) => {
-                return Ok(GpuParse::Rejected(
-                    out.error.expect("rejected runs carry an error"),
-                ));
+        } = match self.stage3.stage2().run_to_lists(ctx, alloc, bufs1)? {
+            Stage2Run::Rejected(rejection) => {
+                return Ok(GpuParse::Rejected(rejection.packed));
             }
             Stage2Run::Accepted(run) => *run,
         };
 
+        let t = super::timing::start();
         let token_total = bufs2.token_total();
         let skeleton_total =
             usize::try_from(header.skeleton_total).expect("skeleton_total fits usize");
@@ -227,11 +321,12 @@ impl GpuPipeline {
         let input_len = bufs1.input_len() as u64;
 
         // --- CPU sync 2 exact allocations -----------------------------------
-        // The tape, zero-filled: accepted runs overwrite every word (each
-        // token's footprint words belong to exactly one CB3 kernel), so
-        // this is defense in depth only (M5 TODO: drop the fill).
-        let mut tape_buf = GpuBuffer::alloc(ctx, tape_words * size_of::<u64>())?;
-        tape_buf.contents_mut().fill(0);
+        // The tape, NOT zero-filled (pooled contents are garbage by
+        // contract): accepted runs overwrite every word — each token's
+        // footprint words belong to exactly one CB3 kernel, the root words
+        // to K13 or the CPU write below — and rejected runs never observe
+        // the tape. Pinned by the pool-poison test in tests/gpu_e2e.rs.
+        let mut tape_buf = alloc.buffer(ctx, tape_words * size_of::<u64>())?;
 
         if skeleton_total == 0 {
             // Root scalar: no structure dispatches run (K13 included), so
@@ -244,8 +339,9 @@ impl GpuPipeline {
 
         let mut bufs3 = if skeleton_total > 0 {
             self.stage3.assert_threadgroup_support(ctx)?;
-            Some(Stage3Buffers::new(
+            Some(Stage3Buffers::new_in(
                 ctx,
+                alloc,
                 skeleton_total,
                 sort_passes(max_depth),
             )?)
@@ -263,22 +359,22 @@ impl GpuPipeline {
                 );
             }
             let chunks = string_total.div_ceil(THREADGROUP_SIZE);
-            // The string buffer, zero-filled so the gap bytes (unspecified
-            // by contract) are deterministic and reference-equal (M5 TODO:
-            // drop the fill).
-            let mut stringbuf = GpuBuffer::alloc(ctx, stringbuf_total)?;
-            stringbuf.contents_mut().fill(0);
+            // The string buffer, NOT zero-filled: K11 writes every record's
+            // `[u32 LE len][content][NUL]` bytes; gap bytes between records
+            // are contractually unspecified (the pinned gap policy — with a
+            // pool they are the previous parse's garbage).
+            let stringbuf = alloc.buffer(ctx, stringbuf_total)?;
             // The long-string append counter gets its precondition
-            // established explicitly (GpuBuffer::alloc makes no contents
-            // guarantee), like K10's fixup counter below.
-            let mut long_count = GpuBuffer::alloc(ctx, size_of::<u32>())?;
+            // established explicitly (pooled contents are garbage), like
+            // K10's fixup counter below.
+            let mut long_count = alloc.buffer(ctx, size_of::<u32>())?;
             long_count.as_mut_slice::<u32>()[0] = 0;
             Some(StringBuffers {
-                record_offsets: GpuBuffer::alloc(ctx, string_total * size_of::<u64>())?,
+                record_offsets: alloc.buffer(ctx, string_total * size_of::<u64>())?,
                 stringbuf,
-                chunk_error: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
+                chunk_error: alloc.buffer(ctx, chunks * size_of::<u64>())?,
                 long_count,
-                long_list: GpuBuffer::alloc(ctx, string_total * size_of::<u32>())?,
+                long_list: alloc.buffer(ctx, string_total * size_of::<u32>())?,
                 chunks,
             })
         } else {
@@ -287,21 +383,24 @@ impl GpuPipeline {
 
         let mut number_bufs = if scalar_total > 0 {
             // Accumulation targets get their preconditions established
-            // explicitly (GpuBuffer::alloc makes no contents guarantee).
-            let mut err_min_pos = GpuBuffer::alloc(ctx, size_of::<u32>())?;
+            // explicitly (pooled contents are garbage by contract).
+            let mut err_min_pos = alloc.buffer(ctx, size_of::<u32>())?;
             err_min_pos.as_mut_slice::<u32>()[0] = NO_NUMBER_ERROR;
-            let mut fixup_count = GpuBuffer::alloc(ctx, size_of::<u32>())?;
+            let mut fixup_count = alloc.buffer(ctx, size_of::<u32>())?;
             fixup_count.as_mut_slice::<u32>()[0] = 0;
             Some(NumberBuffers {
                 err_min_pos,
                 fixup_count,
-                fixup_tokens: GpuBuffer::alloc(ctx, scalar_total * size_of::<u32>())?,
+                fixup_tokens: alloc.buffer(ctx, scalar_total * size_of::<u32>())?,
             })
         } else {
             None
         };
 
+        super::timing::record("sync2: tape/scratch alloc", t, 0.0);
+
         // --- CB3: structure + strings + numbers, one commit, one wait -------
+        let t = super::timing::start();
         if bufs3.is_some() || string_bufs.is_some() || number_bufs.is_some() {
             let mut batch = ctx.batch()?;
             let h_tape = batch.bind_write(&mut tape_buf);
@@ -401,15 +500,25 @@ impl GpuPipeline {
                 )?;
             }
 
-            batch.commit_and_wait()?;
+            let cb3_gpu = batch.commit_and_wait_timed()?;
+            super::timing::record("cb3 (structure + strings + numbers)", t, cb3_gpu);
+        } else {
+            super::timing::record("cb3 (skipped: root scalar)", t, 0.0);
         }
 
         // --- CPU sync 3: merged verdict + fixup patches ----------------------
+        let t = super::timing::start();
         let header = bufs1.read_header();
         let mut error: Option<u64> = header.first_error().map(|(o, c)| (o << 32) | u64::from(c));
         fn merge(packed: u64, error: &mut Option<u64>) {
             *error = Some(error.map_or(packed, |e| e.min(packed)));
         }
+
+        // The CPU view of the input for the fixup re-parses: shared
+        // storage, so this is the same memory the kernels read (the copied
+        // bytes on the Bytes path, the caller's pages on the External
+        // path) — no separate slice needs to ride along.
+        let input = &bufs1.input.contents()[..input_len as usize];
 
         // The K11 long-string patch: re-run the flagged strings through the
         // shared reference unescaper into their precomputed slots of the
@@ -471,14 +580,53 @@ impl GpuPipeline {
             }
         }
 
+        super::timing::record("sync3: verdict + fixup patches", t, 0.0);
+
+        // --- scratch back to the pool ----------------------------------------
+        let t = super::timing::start();
+        bufs2.recycle(pool);
+        if let Some(bufs3) = bufs3 {
+            bufs3.recycle(pool);
+        }
+        let stringbuf = string_bufs.map(|sb| {
+            let StringBuffers {
+                record_offsets,
+                stringbuf,
+                chunk_error,
+                long_count,
+                long_list,
+                chunks: _,
+            } = sb;
+            for buf in [record_offsets, chunk_error, long_count, long_list] {
+                pool.put_back(buf);
+            }
+            stringbuf
+        });
+        if let Some(nb) = number_bufs {
+            let NumberBuffers {
+                err_min_pos,
+                fixup_count,
+                fixup_tokens,
+            } = nb;
+            for buf in [err_min_pos, fixup_count, fixup_tokens] {
+                pool.put_back(buf);
+            }
+        }
+        super::timing::record("scratch recycle (stages 2-3)", t, 0.0);
+
         if let Some(packed) = error {
             // Rejection contract: the tape/string buffers are never
-            // observed — Document construction is short-circuited.
+            // observed — straight back to the pool, Document construction
+            // is short-circuited.
+            pool.put_back(tape_buf);
+            if let Some(buf) = stringbuf {
+                pool.put_back(buf);
+            }
             return Ok(GpuParse::Rejected(packed));
         }
         Ok(GpuParse::Accepted(GpuParseOutput {
             tape: tape_buf,
-            stringbuf: string_bufs.map(|sb| sb.stringbuf),
+            stringbuf,
             fixup_tokens,
             long_string_fixups,
         }))
@@ -619,7 +767,8 @@ mod tests {
         assert_eq!(&bytes[0..6], &[1, 0, 0, 0, b'a', 0]);
         assert_eq!(&bytes[6..12], &[1, 0, 0, 0, b'b', 0]);
         assert_eq!(&bytes[12..19], &[2, 0, 0, 0, b'x', 0x0A, 0]);
-        assert_eq!(bytes[19], 0, "gap byte zero-filled (module M5 note)");
+        // bytes[19] is the gap byte the `\n` escape shrank away —
+        // contractually unspecified (the pinned gap policy), NOT compared.
         assert!(out.fixup_tokens.is_empty());
     }
 

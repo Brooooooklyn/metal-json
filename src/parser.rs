@@ -26,15 +26,23 @@
 //! stays what it is: the bit-exact oracle the GPU is diffed against, not
 //! a runtime escape hatch).
 //!
-//! Still to come (M5): the buffer pool, the zero-copy input paths
-//! (`alloc_input` / `parse_aligned`, mmap-backed `parse_file`) and
-//! zero-copy `Document`s over the shared GPU buffers (today the tape and
-//! string buffer are plain-copied out — see `crate::gpu::pipeline`'s M5
-//! notes).
+//! # The M5 fast path (what a steady-state parse costs)
+//!
+//! - **Buffer pool**: every parse checks its buffers out of the parser's
+//!   [`ScratchPool`] (shared by clones); scratch returns at the end of the
+//!   parse, the tape/string buffers when their [`Document`] drops. Steady
+//!   state does **zero** large allocations; capacities grow-and-keep (see
+//!   `crate::pool`).
+//! - **Zero-copy `Document`**: the tape and string buffer stay in the
+//!   shared GPU memory the kernels wrote; [`Document`] reads them in place.
+//! - **Zero-copy input**: [`Parser::parse_file`] (mmap) and
+//!   [`Parser::parse_aligned`] (caller-held [`AlignedInput`]) wrap the
+//!   input pages with `bytesNoCopy` — no input byte is copied.
+//!   [`Parser::parse`] copies once, into a pooled buffer.
 
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::document::Document;
 use crate::error::Result;
@@ -42,8 +50,11 @@ use crate::error::Result;
 // errors through `decode_packed_error` / the reference pipeline.
 #[allow(unused_imports)]
 use crate::error::Error;
-use crate::gpu::pipeline::{GpuParse, GpuPipeline, decode_packed_error};
-use crate::metal::MetalContext;
+use crate::gpu::pipeline::{GpuInput, GpuParse, GpuPipeline, decode_packed_error};
+use crate::input::AlignedInput;
+use crate::metal::{GpuBuffer, MetalContext};
+use crate::pool::ScratchPool;
+use crate::stage::{MAX_INPUT_BYTES, WORD_BYTES};
 use crate::tape::{StringBuffer, TapeBuffer};
 
 /// Container nesting limit applied by default (simdjson parity).
@@ -146,6 +157,10 @@ impl Default for ParserOptions {
 struct GpuState {
     ctx: MetalContext,
     pipeline: GpuPipeline,
+    /// The M5 buffer pool. `Arc` because every GPU-backed [`Document`]
+    /// holds a handle (its tape/string buffers return here on drop, and
+    /// the pool must outlive any document even if the parser is gone).
+    pool: Arc<ScratchPool>,
 }
 
 /// A reusable JSON parser.
@@ -187,6 +202,7 @@ impl Parser {
             Backend::Gpu => Some(Rc::new(GpuState {
                 ctx: MetalContext::new()?,
                 pipeline: GpuPipeline::new(),
+                pool: Arc::new(ScratchPool::new()),
             })),
             #[cfg(feature = "cpu-reference")]
             Backend::CpuReference => None,
@@ -215,23 +231,13 @@ impl Parser {
         match self.opts.backend {
             Backend::Gpu => {
                 let gpu = self.gpu.as_ref().expect("Gpu backend constructed its state");
-                match gpu.pipeline.run(&gpu.ctx, json, self.opts.max_depth)? {
-                    GpuParse::Rejected(packed) => {
-                        Err(decode_packed_error(packed, self.opts.max_depth))
-                    }
-                    GpuParse::Accepted(out) => {
-                        // Plain copies out of the shared GPU buffers; the
-                        // M5 zero-copy plan hands the buffers to Document
-                        // directly.
-                        let tape = TapeBuffer::from_words(out.tape.as_slice::<u64>().to_vec());
-                        let strings = StringBuffer::from_bytes(
-                            out.stringbuf
-                                .map(|b| b.contents().to_vec())
-                                .unwrap_or_default(),
-                        );
-                        Ok(Document::from_parts(tape, strings))
-                    }
-                }
+                let parse = gpu.pipeline.run_pooled(
+                    &gpu.ctx,
+                    &gpu.pool,
+                    GpuInput::Bytes(json),
+                    self.opts.max_depth,
+                )?;
+                self.finish_gpu(parse)
             }
             #[cfg(feature = "cpu-reference")]
             Backend::CpuReference => {
@@ -241,18 +247,130 @@ impl Parser {
         }
     }
 
-    /// Parse a JSON file.
+    /// Parse from a caller-held [`AlignedInput`] — the **zero-copy** input
+    /// path: the input pages are wrapped with `MTLBuffer bytesNoCopy` and
+    /// read by the GPU in place. Build the `AlignedInput` once, parse from
+    /// it as often as needed.
     ///
-    /// Reads the file into memory and delegates to [`parse`](Self::parse);
-    /// the mmap-backed zero-copy path arrives in M5.
+    /// On the `cpu-reference` backend this is equivalent to
+    /// [`parse`](Self::parse) (the oracle reads any slice).
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the file cannot be read, otherwise as
+    /// As [`parse`](Self::parse).
+    pub fn parse_aligned(&self, input: &AlignedInput) -> Result<Document> {
+        match self.opts.backend {
+            Backend::Gpu => {
+                let gpu = self.gpu.as_ref().expect("Gpu backend constructed its state");
+                // SAFETY: `AlignedInput` guarantees a 16 KiB-aligned,
+                // page-multiple, readable+writable allocation with a
+                // space-padded tail; the wrapper is dropped inside
+                // `run_pooled` (with the parse's stage-1 buffers), strictly
+                // before the `&input` borrow ends, and no `&mut` to the
+                // input can exist while that borrow is live.
+                let buffer = unsafe {
+                    GpuBuffer::from_page_aligned(&gpu.ctx, input.base_ptr(), input.len())?
+                };
+                let parse = gpu.pipeline.run_pooled(
+                    &gpu.ctx,
+                    &gpu.pool,
+                    GpuInput::External {
+                        buffer,
+                        len: input.len(),
+                    },
+                    self.opts.max_depth,
+                )?;
+                self.finish_gpu(parse)
+            }
+            #[cfg(feature = "cpu-reference")]
+            Backend::CpuReference => self.parse(input),
+        }
+    }
+
+    /// Parse a JSON file — the guaranteed **zero-copy** input path on the
+    /// GPU backend: the file is mmap'd (private, copy-on-write — the file
+    /// is never modified), the tail of the last 64-byte word is
+    /// space-padded in the private mapping, and the pages are wrapped with
+    /// `bytesNoCopy` for the parse. The mapping is held for the parse
+    /// duration only; the returned [`Document`] never borrows the input.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be opened or mapped, otherwise as
     /// [`parse`](Self::parse).
     pub fn parse_file(&self, path: impl AsRef<Path>) -> Result<Document> {
-        let bytes = std::fs::read(path)?;
-        self.parse(&bytes)
+        match self.opts.backend {
+            Backend::Gpu => self.parse_file_gpu(path.as_ref()),
+            #[cfg(feature = "cpu-reference")]
+            Backend::CpuReference => {
+                let bytes = std::fs::read(path)?;
+                self.parse(&bytes)
+            }
+        }
+    }
+
+    fn parse_file_gpu(&self, path: &Path) -> Result<Document> {
+        let gpu = self.gpu.as_ref().expect("Gpu backend constructed its state");
+        let file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len > MAX_INPUT_BYTES {
+            return Err(Error::InputTooLarge {
+                len: file_len,
+                max: MAX_INPUT_BYTES,
+            });
+        }
+        let len = usize::try_from(file_len).expect("checked against MAX_INPUT_BYTES");
+        if len == 0 {
+            // mmap rejects zero-length mappings; the empty verdict needs no
+            // GPU anyway.
+            return self.parse(&[]);
+        }
+
+        // Map privately (copy-on-write): the kernels need the bytes between
+        // `len` and the next 64-byte word boundary to be ASCII spaces (the
+        // same padding the copied path writes), and a COW mapping lets that
+        // tail be written without touching the file. The padded length
+        // never crosses into a page beyond the file's last page (64 divides
+        // the page size), so every touched byte is file-backed.
+        let padded_len = len.next_multiple_of(WORD_BYTES);
+        let mut map = unsafe { memmap2::MmapOptions::new().len(padded_len).map_copy(&file) }?;
+        map[len..padded_len].fill(b' ');
+
+        let ptr = core::ptr::NonNull::new(map.as_mut_ptr()).expect("mmap never returns null");
+        // SAFETY: mmap returns page-aligned memory; the mapping covers
+        // `len.next_multiple_of(PAGE_SIZE)` bytes of one valid
+        // readable+writable (MAP_PRIVATE) allocation; `map` outlives the
+        // wrapper, which is dropped inside `run_pooled`; the CPU does not
+        // touch the mapping after the space-fill above.
+        let buffer = unsafe { GpuBuffer::from_page_aligned(&gpu.ctx, ptr, len)? };
+        let parse = gpu.pipeline.run_pooled(
+            &gpu.ctx,
+            &gpu.pool,
+            GpuInput::External { buffer, len },
+            self.opts.max_depth,
+        )?;
+        // `map` stays alive until here — past the GPU work and the wrapper's
+        // drop — then unmaps.
+        drop(map);
+        self.finish_gpu(parse)
+    }
+
+    /// Shared GPU epilogue: decode rejections; wrap accepted tape/string
+    /// buffers into the zero-copy [`Document`] (the buffers return to the
+    /// pool when it drops).
+    fn finish_gpu(&self, parse: GpuParse) -> Result<Document> {
+        let gpu = self.gpu.as_ref().expect("Gpu backend constructed its state");
+        match parse {
+            GpuParse::Rejected(packed) => Err(decode_packed_error(packed, self.opts.max_depth)),
+            GpuParse::Accepted(out) => {
+                let tape = TapeBuffer::from_gpu(out.tape, Arc::clone(&gpu.pool));
+                let strings = match out.stringbuf {
+                    Some(buf) => StringBuffer::from_gpu(buf, Arc::clone(&gpu.pool)),
+                    None => StringBuffer::new(),
+                };
+                Ok(Document::from_parts(tape, strings))
+            }
+        }
     }
 }
 

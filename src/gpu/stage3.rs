@@ -96,6 +96,7 @@ use crate::parser::DEFAULT_MAX_DEPTH;
 use crate::stage::{Stage, Stage1Buffers, Stage2Buffers, Stage3Buffers, sort_passes};
 use crate::tape::{make_final_root, make_root};
 
+use super::stage1::Stage1Output;
 use super::stage2::{Stage2, Stage2Accepted, Stage2Output, Stage2Run};
 
 /// `MjErrorCode` values produced by CB3. Mirror `shaders/common.h` — keep
@@ -308,17 +309,17 @@ impl Stage3 {
     ) -> Result<(Stage3Output, f64)> {
         // --- CB1 → CB2 → CB2b (stage 2 owns the first two syncs) -----------
         let Stage2Accepted {
-            stage1,
             bufs2,
             header,
             mut gpu_seconds,
-        } = match self.stage2.run_to_lists(ctx, bufs1)? {
-            Stage2Run::Rejected(out) => {
-                let packed = out.error.expect("rejected runs carry an error");
-                return Ok((Stage3Output::rejected(*out, packed), 0.0));
+        } = match self.stage2.run_to_lists(ctx, crate::pool::Alloc::Direct, bufs1)? {
+            Stage2Run::Rejected(rejection) => {
+                let out = Stage2Output::from_rejection(bufs1, &rejection);
+                return Ok((Stage3Output::rejected(out, rejection.packed), 0.0));
             }
             Stage2Run::Accepted(run) => *run,
         };
+        let stage1 = Stage1Output::snapshot(bufs1, &header, None);
         let stage2_out = Stage2::collect_outputs(stage1, &bufs2, &header);
 
         let skeleton_total =
@@ -508,6 +509,7 @@ impl Stage3 {
         let h_depths = batch.bind_write(&mut bufs3.depths);
         let h_err = batch.bind_write(&mut bufs3.chunk_error);
         let h_hist = batch.bind_write(&mut bufs3.sort_hist);
+        let h_max_key = batch.bind_write(&mut bufs3.max_key);
         let h_sorted = batch.bind_write(&mut bufs3.sorted);
         let h_scratch = bufs3.sorted_scratch.as_mut().map(|b| batch.bind_write(b));
         let h_ctx = batch.bind_write(&mut bufs3.chunk_ctx);
@@ -525,13 +527,13 @@ impl Stage3 {
         )?;
         self.depth_spine.encode(
             batch,
-            &[h_chunk_depth],
+            &[h_chunk_depth, h_max_key],
             Some(&chunk_params),
             Dispatch::Threadgroups(1),
         )?;
         self.depth_apply.encode(
             batch,
-            &[h_skel_byte, h_skel_pos, h_chunk_depth, h_depths, h_err],
+            &[h_skel_byte, h_skel_pos, h_chunk_depth, h_depths, h_err, h_max_key],
             Some(&skel_params),
             Dispatch::Threadgroups(chunks),
         )?;
@@ -561,21 +563,27 @@ impl Stage3 {
                 reserved0: u64::from(max_depth),
                 reserved1: (5 * pass as u64) | if pass == 0 { 1 << 8 } else { 0 },
             };
+            // The matrix scan needs the pass shift too (for the
+            // shallow-pass skip), with its own element count.
+            let pass_matrix_params = MjParams {
+                reserved1: pass_params.reserved1,
+                ..matrix_params
+            };
             self.sort_hist.encode(
                 batch,
-                &[h_depths, h_in, h_hist],
+                &[h_depths, h_in, h_hist, h_max_key],
                 Some(&pass_params),
                 Dispatch::Threadgroups(chunks),
             )?;
             self.sort_matrix_scan.encode(
                 batch,
-                &[h_hist],
-                Some(&matrix_params),
+                &[h_hist, h_max_key],
+                Some(&pass_matrix_params),
                 Dispatch::Threadgroups(1),
             )?;
             self.sort_scatter.encode(
                 batch,
-                &[h_depths, h_in, h_hist, h_out],
+                &[h_depths, h_in, h_hist, h_out, h_max_key],
                 Some(&pass_params),
                 Dispatch::Threadgroups(chunks),
             )?;

@@ -25,6 +25,10 @@
 //! `Backend::Gpu` drives [`pipeline::GpuPipeline`]; everything else here is
 //! a narrower per-milestone test orchestration.
 //!
+//! M5 scope: [`timing`] — coarse per-phase wall/GPU breakdown of a full
+//! parse behind the `timing` feature (no-op otherwise), driving the
+//! optimization order.
+//!
 //! Internal/unstable: exposed publicly so integration tests can drive the
 //! pipeline directly (like [`crate::metal`] and [`crate::stage`]), but not
 //! part of the supported API surface.
@@ -35,9 +39,10 @@ pub mod stage1;
 pub mod stage2;
 pub mod stage3;
 pub mod strings;
+pub mod timing;
 
 pub use numbers::{ERR_NUMBER, Numbers, NumbersOutput, patch_number_fixups, run_numbers};
-pub use pipeline::{GpuParse, GpuParseOutput, GpuPipeline};
+pub use pipeline::{GpuInput, GpuParse, GpuParseOutput, GpuPipeline};
 pub use stage1::{ERR_STRING, ERR_UTF8, Stage1, Stage1Output, run_stage1};
 pub use stage2::{
     ERR_EMPTY_INPUT, ERR_INVALID_LITERAL, ERR_MISSING_COLON, ERR_MISSING_COMMA, ERR_UNBALANCED,

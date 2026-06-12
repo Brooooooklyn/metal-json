@@ -12,10 +12,14 @@
 //   strings_unescape       1 thread / string-list entry: validate + unescape
 //                          one string literal into its
 //                          [u32 LE len][content][NUL] record and write the
-//                          string tape word at tape_ofs[token]. Fast path:
-//                          16-byte blocks free of escapes / control bytes
-//                          are copied verbatim; escape path: sequential
-//                          unescape with full surrogate-pair validation.
+//                          string tape word at tape_ofs[token]. Escape-free
+//                          strings (the overwhelming majority) are copied
+//                          by a lane-parallel (short) or simdgroup-
+//                          cooperative (long) clean scan; strings that hit
+//                          a backslash / control byte are compacted across
+//                          the threadgroup and rerun through the sequential
+//                          unescape path with full surrogate-pair
+//                          validation (see the kernel comment).
 //   structure_finalize     (10_pair_ctx.metal, REUSED) 1 threadgroup:
 //                          min-fold the per-chunk K11 error words into
 //                          header.error.
@@ -90,8 +94,19 @@ constant constexpr uint MJ_STR_CHUNK_STRINGS = THREADGROUP_SIZE;
 // Rust test parses this file and pins them).
 constant constexpr uint MJ_LONG_STRING_THRESHOLD = 16384;
 
-// Fast-path block width in bytes (the vectorized clean-scan grain).
+// Fast-path block width in bytes (the vectorized clean-scan grain of the
+// careful per-thread path).
 constant constexpr uint MJ_STR_BLOCK = 16;
+
+// Strings with raw_len STRICTLY ABOVE this many bytes are copied
+// simdgroup-cooperatively (32 lanes × consecutive bytes — coalesced and
+// divergence-free) instead of by one lane's byte loop. 32 keeps the
+// lane-parallel phase's worst case at one block while the cooperative
+// phase pays one ~5-instruction setup per string, which only wins once a
+// string spans multiple 32-byte blocks. (Twitter-shaped data: ~91% of
+// strings are ≤ 32 B but the ≥ 32 B tail owns ~half the string bytes and,
+// pre-split, made every SIMD lane wait out the longest string's byte walk.)
+constant constexpr uint MJ_STR_COOP_CUT = 32;
 
 // --- string_record_offsets ---------------------------------------------------------
 
@@ -400,6 +415,29 @@ static inline uint64_t mj_str_unescape_one(
     return MJ_HEADER_NO_ERROR;
 }
 
+// Finish a CLEAN (copied-verbatim) record: the [u32 LE len] header, the
+// trailing NUL, and the string tape word — exactly the record/tape epilogue
+// of mj_str_unescape_one with `o == raw_len` (clean strings never shrink).
+static inline void mj_str_finish_record(
+    device uchar* stringbuf,
+    device ulong* tape,
+    device const uint* tape_ofs,
+    ulong rec,
+    ulong len,
+    ulong t,
+    ulong tape_words)
+{
+    stringbuf[rec] = uchar(len & 0xFFu);
+    stringbuf[rec + 1] = uchar((len >> 8) & 0xFFu);
+    stringbuf[rec + 2] = uchar((len >> 16) & 0xFFu);
+    stringbuf[rec + 3] = uchar((len >> 24) & 0xFFu);
+    stringbuf[rec + ulong(MJ_STRING_RECORD_HEADER_BYTES) + len] = uchar(0);
+    ulong pos = ulong(tape_ofs[t]);
+    if (pos < tape_words) { // defensive; always true on accepted inputs
+        tape[pos] = mj_make_string(rec);
+    }
+}
+
 // K11: one thread per string-list entry, MJ_STR_CHUNK_STRINGS entries per
 // threadgroup. Validates + unescapes every string at or under the
 // long-string threshold, writes the records and string tape words, and
@@ -409,6 +447,28 @@ static inline uint64_t mj_str_unescape_one(
 // are appended (string-list index) to the long-string fixup list instead —
 // the CPU patch pass owns their records, tape words AND their error
 // verdicts (see the valve note in the header comment).
+//
+// EXECUTION SHAPE (the M5 divergence fix; semantics unchanged): strings
+// without escapes or control bytes are verbatim copies, and on real data
+// they are the overwhelming majority (~93% on twitter), so the kernel is
+// organized as a clean-copy attempt with the original sequential
+// validator/unescaper demoted to a rare per-thread fallback:
+//
+//   phase 1  raw_len ≤ MJ_STR_COOP_CUT: each lane scan-copies its own
+//            string byte-wise (bounded at one 32-byte block — short
+//            strings no longer wait out a long neighbor's walk);
+//   phase 2  raw_len > MJ_STR_COOP_CUT: the whole simdgroup copies one
+//            such string at a time, 32 consecutive bytes per step —
+//            coalesced loads/stores, zero divergence;
+//   phase 3  strings whose scan hit a backslash or control byte rerun
+//            through mj_str_unescape_one UNCHANGED (its leftmost-error
+//            verdicts and record bytes are the pinned semantics; the
+//            phase-1/2 prefix writes it overwrites — or strands as gap
+//            bytes, which are contractually unspecified).
+//
+// Every phase-1/2 write stays inside the string's own record content area
+// (`dst[idx]`, idx < raw_len < slot), so the eager copy can never touch a
+// neighboring record.
 //
 //   params.element_count = string_total
 //   params.reserved0     = tape length in words (defensive bound)
@@ -426,47 +486,152 @@ kernel void strings_unescape(
     device uint* long_list [[buffer(9)]],
     constant MjParams& params [[buffer(10)]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]])
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
 {
     threadgroup ulong lanes[THREADGROUP_SIZE];
 
     ulong n = params.element_count; // string_total
+    ulong token_total = params.reserved1;
+    ulong tape_words = params.reserved0;
     ulong s = ulong(tgid) * ulong(MJ_STR_CHUNK_STRINGS) + ulong(lid);
 
     uint64_t err = MJ_HEADER_NO_ERROR;
+
+    // Per-lane metadata (consecutive s → coalesced loads). raw_len is pure
+    // token-position math (the same `close - open - 1`
+    // mj_str_unescape_one recomputes), so the routing needs no content
+    // reads.
+    bool todo = false; // a string this kernel owns (in range, not long)
+    ulong t = 0;
+    ulong open_pos = 0;
+    ulong raw_len = 0;
     if (s < n) {
-        // The long-string valve: raw_len is pure token-position math (the
-        // same `close - open - 1` mj_str_unescape_one recomputes), so the
-        // routing decision needs no content reads.
-        ulong t = ulong(string_tokens[s]);
-        ulong raw_len = (t + 1 < params.reserved1)
-            ? ulong(tok_pos[t + 1] - tok_pos[t]) - 1
-            : 0;
-        if (raw_len > ulong(MJ_LONG_STRING_THRESHOLD)) {
-            // Defer to the CPU patch pass: append the string-list index
-            // (at most one append per thread, so slot < string_total and
-            // the index-sized list the runner allocated cannot overflow).
-            uint slot = atomic_fetch_add_explicit(long_count, 1u,
-                                                  memory_order_relaxed);
-            long_list[slot] = uint(s);
-            // err stays NO_ERROR: this string's verdict belongs to the CPU.
-        } else {
-            err = mj_str_unescape_one(input, tok_pos, string_tokens,
-                                      record_offsets, tape_ofs, stringbuf,
-                                      tape, s, params.reserved1,
-                                      params.reserved0);
+        t = ulong(string_tokens[s]);
+        if (t + 1 < token_total) { // defensive, mirrors mj_str_unescape_one
+            open_pos = ulong(tok_pos[t]);
+            raw_len = ulong(tok_pos[t + 1]) - open_pos - 1;
+            if (raw_len > ulong(MJ_LONG_STRING_THRESHOLD)) {
+                // The long-string valve: defer to the CPU patch pass —
+                // append the string-list index (at most one append per
+                // thread, so slot < string_total and the index-sized list
+                // the runner allocated cannot overflow). err stays
+                // NO_ERROR: this string's verdict belongs to the CPU.
+                uint slot = atomic_fetch_add_explicit(long_count, 1u,
+                                                      memory_order_relaxed);
+                long_list[slot] = uint(s);
+            } else {
+                todo = true;
+            }
         }
     }
 
-    // Deterministic per-chunk min (every thread reaches the barrier; the
-    // helper above returns rather than exiting the kernel).
+    // --- phase 1: lane-parallel clean scan-copy (short strings) -----------
+    bool dirty = false; // hit a backslash / control byte → phase 3
+    bool coop = todo && raw_len > ulong(MJ_STR_COOP_CUT);
+    if (todo && !coop) {
+        device const uchar* raw = input + (open_pos + 1);
+        ulong rec = record_offsets[s];
+        device uchar* dst = stringbuf + rec + ulong(MJ_STRING_RECORD_HEADER_BYTES);
+        bool clean = true;
+        for (ulong i = 0; i < raw_len; ++i) {
+            uchar b = raw[i];
+            dst[i] = b;
+            clean = clean && (b >= uchar(0x20)) && (b != uchar('\\'));
+        }
+        if (clean) {
+            mj_str_finish_record(stringbuf, tape, tape_ofs, rec, raw_len, t,
+                                 tape_words);
+        } else {
+            dirty = true;
+        }
+    }
+
+    // --- phase 2: simdgroup-cooperative clean scan-copy (long strings) ----
+    // One balloted string at a time; every lane re-reads its metadata from
+    // the same addresses (broadcast loads — cache-served, no 64-bit
+    // shuffles needed). The ballot mask is simdgroup-uniform, so the loop
+    // and the simd_all vote below execute convergently.
+    ulong sg_base = ulong(tgid) * ulong(MJ_STR_CHUNK_STRINGS) + ulong(simd_id) * 32ul;
+    uint mask = uint(static_cast<simd_vote::vote_t>(simd_ballot(coop)));
+    while (mask != 0u) {
+        uint u = ctz(mask);
+        mask &= mask - 1u;
+        ulong su = sg_base + ulong(u);
+        ulong tu = ulong(string_tokens[su]);
+        ulong open_u = ulong(tok_pos[tu]);
+        ulong len_u = ulong(tok_pos[tu + 1]) - open_u - 1;
+        ulong rec_u = record_offsets[su];
+        device const uchar* raw = input + (open_u + 1);
+        device uchar* dst = stringbuf + rec_u + ulong(MJ_STRING_RECORD_HEADER_BYTES);
+        bool u_dirty = false;
+        for (ulong blk = 0; blk < len_u; blk += 32ul) {
+            ulong idx = blk + ulong(simd_lane);
+            uchar b = uchar(0x20); // out-of-range lanes vote clean
+            if (idx < len_u) {
+                b = raw[idx];
+                dst[idx] = b;
+            }
+            bool ok = (b >= uchar(0x20)) && (b != uchar('\\'));
+            if (!simd_all(ok)) {
+                u_dirty = true;
+                break;
+            }
+        }
+        if (simd_lane == u) { // the owner lane records the outcome
+            if (u_dirty) {
+                dirty = true;
+            } else {
+                mj_str_finish_record(stringbuf, tape, tape_ofs, rec_u, len_u,
+                                     tu, tape_words);
+            }
+        }
+    }
+
+    // --- phase 3: the careful path for strings with escapes ---------------
+    // Compacted across the threadgroup first: on escape-sprinkled data
+    // (twitter: ~7% of strings) almost every SIMD group would otherwise
+    // host one or two dirty strings and stall all 32 lanes for one lane's
+    // sequential unescape walk. Queueing the dirty lids through threadgroup
+    // memory packs them into the fewest possible SIMD groups; the rest of
+    // the threadgroup sails through. Reassignment is safe because a dirty
+    // string's record/tape writes and error verdict are functions of the
+    // string alone, and the chunk verdict below is an order-independent
+    // min over the whole threadgroup (which lane computed it is
+    // unobservable).
+    threadgroup atomic_uint dirty_n;
+    threadgroup uchar dirty_lids[THREADGROUP_SIZE];
+    if (lid == 0u) {
+        atomic_store_explicit(&dirty_n, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dirty) {
+        uint q = atomic_fetch_add_explicit(&dirty_n, 1u, memory_order_relaxed);
+        dirty_lids[q] = uchar(lid);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint dn = atomic_load_explicit(&dirty_n, memory_order_relaxed);
+    if (lid < dn) {
+        ulong ds = ulong(tgid) * ulong(MJ_STR_CHUNK_STRINGS)
+            + ulong(dirty_lids[lid]);
+        err = mj_str_unescape_one(input, tok_pos, string_tokens,
+                                  record_offsets, tape_ofs, stringbuf,
+                                  tape, ds, token_total, tape_words);
+    }
+
+    // Deterministic per-chunk min (every thread reaches the barriers; the
+    // helper above returns rather than exiting the kernel): barrier tree
+    // instead of a serial 256-element walk by thread 0.
     lanes[lid] = err;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0u) {
-        uint64_t chunk_min = MJ_HEADER_NO_ERROR;
-        for (uint k = 0u; k < THREADGROUP_SIZE; ++k) {
-            chunk_min = min(chunk_min, lanes[k]);
+    for (uint stride = THREADGROUP_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            lanes[lid] = min(lanes[lid], lanes[lid + stride]);
         }
-        chunk_error[tgid] = chunk_min;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        chunk_error[tgid] = lanes[0];
     }
 }

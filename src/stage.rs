@@ -17,6 +17,7 @@ use crate::metal::{
     Binding, BoundBuffer, CommandBatch, Dispatch, GpuBuffer, MetalContext, MjHeader, MjParams,
     Pipeline, Pod,
 };
+use crate::pool::{Alloc, ScratchPool};
 
 // --- Pipeline geometry (mirrors shaders/common.h — keep in sync) ------------
 
@@ -273,10 +274,16 @@ pub struct Stage1Buffers {
     /// continuation byte) at the same offset the reference reports.
     /// Kernels still mask the tail word by `input_len` (defense in depth).
     ///
-    /// This is the copied path; the zero-copy mmap path
-    /// ([`GpuBuffer::from_page_aligned`]) arrives with the `Parser`
-    /// integration.
+    /// The zero-copy path ([`Stage1Buffers::with_external_input`]) instead
+    /// wraps caller-held page-aligned memory via
+    /// [`GpuBuffer::from_page_aligned`]; that caller guarantees the same
+    /// space-padding invariant for the tail word.
     pub input: GpuBuffer,
+    /// True when `input` wraps caller-owned memory
+    /// ([`with_external_input`](Self::with_external_input)): it must never
+    /// be returned to a pool (the wrapped memory's lifetime belongs to the
+    /// caller).
+    input_external: bool,
     input_len: usize,
     words: usize,
     chunks: usize,
@@ -344,36 +351,70 @@ impl Stage1Buffers {
     /// [`Error::InputTooLarge`] above [`MAX_INPUT_BYTES`];
     /// [`Error::BufferAlloc`] if the device is out of memory.
     pub fn new(ctx: &MetalContext, input: &[u8]) -> Result<Self> {
-        if input.len() as u64 > MAX_INPUT_BYTES {
-            return Err(Error::InputTooLarge {
-                len: input.len() as u64,
-                max: MAX_INPUT_BYTES,
-            });
-        }
-        let words = input.len().div_ceil(WORD_BYTES);
-        let chunks = words.div_ceil(CHUNK_WORDS);
+        Self::new_in(ctx, Alloc::Direct, input)
+    }
 
-        let mut input_buf = GpuBuffer::alloc(ctx, words * WORD_BYTES)?;
+    /// [`new`](Self::new) with an explicit buffer source (the production
+    /// parse path passes the parser's pool; the buffers come back with the
+    /// previous parse's contents, which is why every precondition below is
+    /// an explicit fill).
+    pub(crate) fn new_in(ctx: &MetalContext, alloc: Alloc<'_>, input: &[u8]) -> Result<Self> {
+        check_input_len(input.len() as u64)?;
+        let words = input.len().div_ceil(WORD_BYTES);
+        let mut input_buf = alloc.buffer(ctx, words * WORD_BYTES)?;
         let bytes = input_buf.contents_mut();
         bytes[..input.len()].copy_from_slice(input);
         bytes[input.len()..].fill(b' ');
+        Self::assemble(ctx, alloc, input_buf, input.len(), false)
+    }
+
+    /// Build the stage-1 set around a caller-provided input buffer — the
+    /// zero-copy path ([`GpuBuffer::from_page_aligned`] over an
+    /// [`AlignedInput`](crate::AlignedInput) or an mmap). No input byte is
+    /// copied; only the scratch buffers are allocated (from `alloc`).
+    ///
+    /// The caller guarantees, in addition to `from_page_aligned`'s
+    /// contract, that bytes `input_len..input_len.next_multiple_of(64)` of
+    /// the wrapped region are **ASCII spaces** — the same padding invariant
+    /// [`new`](Self::new) writes (kernel tail words must classify the
+    /// padding as whitespace).
+    pub(crate) fn with_external_input(
+        ctx: &MetalContext,
+        alloc: Alloc<'_>,
+        input_buf: GpuBuffer,
+        input_len: usize,
+    ) -> Result<Self> {
+        check_input_len(input_len as u64)?;
+        Self::assemble(ctx, alloc, input_buf, input_len, true)
+    }
+
+    fn assemble(
+        ctx: &MetalContext,
+        alloc: Alloc<'_>,
+        input_buf: GpuBuffer,
+        input_len: usize,
+        input_external: bool,
+    ) -> Result<Self> {
+        let words = input_len.div_ceil(WORD_BYTES);
+        let chunks = words.div_ceil(CHUNK_WORDS);
 
         // No zero/init needed: K1 overwrites every word of these.
-        let bm_quote = GpuBuffer::alloc(ctx, words * size_of::<u64>())?;
-        let bm_tok = GpuBuffer::alloc(ctx, words * size_of::<u64>())?;
-        let escape_info = GpuBuffer::alloc(ctx, words)?;
+        let bm_quote = alloc.buffer(ctx, words * size_of::<u64>())?;
+        let bm_tok = alloc.buffer(ctx, words * size_of::<u64>())?;
+        let escape_info = alloc.buffer(ctx, words)?;
         // Kernel accumulation targets: establish the documented zero/init
         // preconditions explicitly (a few bytes per 64 KiB chunk — cheap).
-        let mut chunk_quote_counts = GpuBuffer::alloc(ctx, chunks * size_of::<u32>())?;
-        let mut chunk_token_counts = GpuBuffer::alloc(ctx, chunks * size_of::<u32>())?;
-        let mut header = GpuBuffer::alloc(ctx, size_of::<MjHeader>())?;
+        let mut chunk_quote_counts = alloc.buffer(ctx, chunks * size_of::<u32>())?;
+        let mut chunk_token_counts = alloc.buffer(ctx, chunks * size_of::<u32>())?;
+        let mut header = alloc.buffer(ctx, size_of::<MjHeader>())?;
         chunk_quote_counts.contents_mut().fill(0);
         chunk_token_counts.contents_mut().fill(0);
         header.as_mut_slice::<MjHeader>()[0] = MjHeader::new();
 
         Ok(Self {
             input: input_buf,
-            input_len: input.len(),
+            input_external,
+            input_len,
             words,
             chunks,
             bm_quote,
@@ -430,10 +471,70 @@ impl Stage1Buffers {
     /// `tok_kind` (`token_count` bytes) — exact-size, never a worst-case
     /// `input_len`-proportional guess.
     pub fn alloc_tokens(&mut self, ctx: &MetalContext, token_count: usize) -> Result<()> {
-        self.tok_pos = Some(GpuBuffer::alloc(ctx, token_count * size_of::<u32>())?);
-        self.tok_kind = Some(GpuBuffer::alloc(ctx, token_count)?);
+        self.alloc_tokens_in(ctx, Alloc::Direct, token_count)
+    }
+
+    /// [`alloc_tokens`](Self::alloc_tokens) with an explicit buffer source.
+    /// No preconditions: the K5 scatter writes every entry (dense ranks).
+    pub(crate) fn alloc_tokens_in(
+        &mut self,
+        ctx: &MetalContext,
+        alloc: Alloc<'_>,
+        token_count: usize,
+    ) -> Result<()> {
+        self.tok_pos = Some(alloc.buffer(ctx, token_count * size_of::<u32>())?);
+        self.tok_kind = Some(alloc.buffer(ctx, token_count)?);
         Ok(())
     }
+
+    /// Return every pool-eligible buffer to `pool`. An external input
+    /// buffer ([`with_external_input`](Self::with_external_input)) wraps
+    /// caller memory and is dropped instead of pooled.
+    pub(crate) fn recycle(self, pool: &ScratchPool) {
+        let Self {
+            input,
+            input_external,
+            bm_quote,
+            bm_tok,
+            escape_info,
+            chunk_quote_counts,
+            chunk_token_counts,
+            header,
+            tok_pos,
+            tok_kind,
+            ..
+        } = self;
+        if !input_external {
+            pool.put_back(input);
+        }
+        for buf in [
+            bm_quote,
+            bm_tok,
+            escape_info,
+            chunk_quote_counts,
+            chunk_token_counts,
+            header,
+        ] {
+            pool.put_back(buf);
+        }
+        if let Some(buf) = tok_pos {
+            pool.put_back(buf);
+        }
+        if let Some(buf) = tok_kind {
+            pool.put_back(buf);
+        }
+    }
+}
+
+/// The shared `MAX_INPUT_BYTES` guard for both input paths.
+fn check_input_len(len: u64) -> Result<()> {
+    if len > MAX_INPUT_BYTES {
+        return Err(Error::InputTooLarge {
+            len,
+            max: MAX_INPUT_BYTES,
+        });
+    }
+    Ok(())
 }
 
 // --- Stage2Buffers ----------------------------------------------------------------
@@ -534,14 +635,25 @@ impl Stage2Buffers {
     ///
     /// [`Error::BufferAlloc`] if the device is out of memory.
     pub fn new(ctx: &MetalContext, token_total: usize) -> Result<Self> {
+        Self::new_in(ctx, Alloc::Direct, token_total)
+    }
+
+    /// [`new`](Self::new) with an explicit buffer source (no zero/init
+    /// preconditions — see the struct docs — so pooled reuse needs no
+    /// resets).
+    pub(crate) fn new_in(
+        ctx: &MetalContext,
+        alloc: Alloc<'_>,
+        token_total: usize,
+    ) -> Result<Self> {
         let chunks = token_total.div_ceil(TOKEN_CHUNK_TOKENS);
         Ok(Self {
             token_total,
             chunks,
-            chunk_counts: GpuBuffer::alloc(ctx, chunks * 4 * size_of::<u32>())?,
-            chunk_string_bytes: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
-            chunk_error: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
-            tape_ofs: GpuBuffer::alloc(ctx, token_total * size_of::<u32>())?,
+            chunk_counts: alloc.buffer(ctx, chunks * 4 * size_of::<u32>())?,
+            chunk_string_bytes: alloc.buffer(ctx, chunks * size_of::<u64>())?,
+            chunk_error: alloc.buffer(ctx, chunks * size_of::<u64>())?,
+            tape_ofs: alloc.buffer(ctx, token_total * size_of::<u32>())?,
             skel_token_index: None,
             skel_pos: None,
             skel_byte: None,
@@ -577,12 +689,49 @@ impl Stage2Buffers {
         string_total: usize,
         scalar_total: usize,
     ) -> Result<()> {
-        self.skel_token_index = Some(GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?);
-        self.skel_pos = Some(GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?);
-        self.skel_byte = Some(GpuBuffer::alloc(ctx, skeleton_total)?);
-        self.string_tokens = Some(GpuBuffer::alloc(ctx, string_total * size_of::<u32>())?);
-        self.scalar_tokens = Some(GpuBuffer::alloc(ctx, scalar_total * size_of::<u32>())?);
+        self.alloc_lists_in(ctx, Alloc::Direct, skeleton_total, string_total, scalar_total)
+    }
+
+    /// [`alloc_lists`](Self::alloc_lists) with an explicit buffer source.
+    pub(crate) fn alloc_lists_in(
+        &mut self,
+        ctx: &MetalContext,
+        alloc: Alloc<'_>,
+        skeleton_total: usize,
+        string_total: usize,
+        scalar_total: usize,
+    ) -> Result<()> {
+        self.skel_token_index = Some(alloc.buffer(ctx, skeleton_total * size_of::<u32>())?);
+        self.skel_pos = Some(alloc.buffer(ctx, skeleton_total * size_of::<u32>())?);
+        self.skel_byte = Some(alloc.buffer(ctx, skeleton_total)?);
+        self.string_tokens = Some(alloc.buffer(ctx, string_total * size_of::<u32>())?);
+        self.scalar_tokens = Some(alloc.buffer(ctx, scalar_total * size_of::<u32>())?);
         Ok(())
+    }
+
+    /// Return every buffer to `pool`.
+    pub(crate) fn recycle(self, pool: &ScratchPool) {
+        let Self {
+            chunk_counts,
+            chunk_string_bytes,
+            chunk_error,
+            tape_ofs,
+            skel_token_index,
+            skel_pos,
+            skel_byte,
+            string_tokens,
+            scalar_tokens,
+            ..
+        } = self;
+        for buf in [chunk_counts, chunk_string_bytes, chunk_error, tape_ofs] {
+            pool.put_back(buf);
+        }
+        for buf in [skel_token_index, skel_pos, skel_byte, string_tokens, scalar_tokens]
+            .into_iter()
+            .flatten()
+        {
+            pool.put_back(buf);
+        }
     }
 }
 
@@ -608,6 +757,7 @@ pub const CTX_STATE_BYTES: usize = 32;
 /// | `depths`          | `m * 4`      | u32 depth per skeleton element                   |
 /// | `chunk_error`     | `c * 8`      | per-chunk min packed CB3 error (depth scan, then K9 folds on top) |
 /// | `sort_hist`       | `32 * c * 4` | bucket-major digit histogram → matrix scan (in place), per pass |
+/// | `max_key`         | `4`          | max clamped sort key (depth scan) → K8 shallow-pass skip |
 /// | `sorted`          | `m * 4`      | the final (depth, document-order) ordering       |
 /// | `sorted_scratch`  | `m * 4`      | radix ping-pong; `None` for single-pass sorts    |
 /// | `chunk_ctx`       | `c * 32`     | K9 segmented-scan summaries → carries (in place) |
@@ -618,7 +768,8 @@ pub const CTX_STATE_BYTES: usize = 32;
 /// # Zero/init preconditions
 ///
 /// None. `chunk_depth`, `chunk_error`, `sort_hist` and `chunk_ctx` are
-/// fully plain-stored by their producer kernels each dispatch; the sort
+/// fully plain-stored by their producer kernels each dispatch; `max_key`
+/// is zero-stored by `depth_spine` before `depth_apply` folds into it; the sort
 /// scatter writes a permutation (every slot exactly once); `depths` is
 /// fully written by `depth_apply`; and `match_index` / `context_opener` /
 /// `child_counts` are fully written by `pair_ctx_apply` on every input
@@ -645,6 +796,11 @@ pub struct Stage3Buffers {
     /// pass, rewritten in place by `sort_matrix_scan` as global output
     /// slots. Re-produced from scratch each pass.
     pub sort_hist: GpuBuffer,
+    /// One `u32`: the maximum clamped sort key over all elements,
+    /// zero-stored by `depth_spine` and max-folded by `depth_apply` each
+    /// parse (so pooled reuse needs no reset). K8 passes whose digits are
+    /// all zero under it degenerate to a stable identity copy.
+    pub max_key: GpuBuffer,
     /// Skeleton indices in (depth, document-order) order — the final K8
     /// output, bit-identical to reference `Stage4Output::sorted_by_depth`.
     pub sorted: GpuBuffer,
@@ -674,6 +830,18 @@ impl Stage3Buffers {
     ///
     /// [`Error::BufferAlloc`] if the device is out of memory.
     pub fn new(ctx: &MetalContext, skeleton_total: usize, passes: usize) -> Result<Self> {
+        Self::new_in(ctx, Alloc::Direct, skeleton_total, passes)
+    }
+
+    /// [`new`](Self::new) with an explicit buffer source (no zero/init
+    /// preconditions — see the struct docs — so pooled reuse needs no
+    /// resets).
+    pub(crate) fn new_in(
+        ctx: &MetalContext,
+        alloc: Alloc<'_>,
+        skeleton_total: usize,
+        passes: usize,
+    ) -> Result<Self> {
         assert!(skeleton_total > 0, "empty skeletons never dispatch CB3");
         assert!(passes > 0, "the sort always runs at least one pass");
         let chunks = skeleton_total.div_ceil(SKELETON_CHUNK_ELEMS);
@@ -681,21 +849,57 @@ impl Stage3Buffers {
             skeleton_total,
             chunks,
             passes,
-            chunk_depth: GpuBuffer::alloc(ctx, chunks * size_of::<i64>())?,
-            depths: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
-            chunk_error: GpuBuffer::alloc(ctx, chunks * size_of::<u64>())?,
-            sort_hist: GpuBuffer::alloc(ctx, 32 * chunks * size_of::<u32>())?,
-            sorted: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
+            chunk_depth: alloc.buffer(ctx, chunks * size_of::<i64>())?,
+            depths: alloc.buffer(ctx, skeleton_total * size_of::<u32>())?,
+            chunk_error: alloc.buffer(ctx, chunks * size_of::<u64>())?,
+            sort_hist: alloc.buffer(ctx, 32 * chunks * size_of::<u32>())?,
+            max_key: alloc.buffer(ctx, size_of::<u32>())?,
+            sorted: alloc.buffer(ctx, skeleton_total * size_of::<u32>())?,
             sorted_scratch: if passes > 1 {
-                Some(GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?)
+                Some(alloc.buffer(ctx, skeleton_total * size_of::<u32>())?)
             } else {
                 None
             },
-            chunk_ctx: GpuBuffer::alloc(ctx, chunks * CTX_STATE_BYTES)?,
-            match_index: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
-            context_opener: GpuBuffer::alloc(ctx, skeleton_total)?,
-            child_counts: GpuBuffer::alloc(ctx, skeleton_total * size_of::<u32>())?,
+            chunk_ctx: alloc.buffer(ctx, chunks * CTX_STATE_BYTES)?,
+            match_index: alloc.buffer(ctx, skeleton_total * size_of::<u32>())?,
+            context_opener: alloc.buffer(ctx, skeleton_total)?,
+            child_counts: alloc.buffer(ctx, skeleton_total * size_of::<u32>())?,
         })
+    }
+
+    /// Return every buffer to `pool`.
+    pub(crate) fn recycle(self, pool: &ScratchPool) {
+        let Self {
+            chunk_depth,
+            depths,
+            chunk_error,
+            sort_hist,
+            max_key,
+            sorted,
+            sorted_scratch,
+            chunk_ctx,
+            match_index,
+            context_opener,
+            child_counts,
+            ..
+        } = self;
+        for buf in [
+            chunk_depth,
+            depths,
+            chunk_error,
+            sort_hist,
+            max_key,
+            sorted,
+            chunk_ctx,
+            match_index,
+            context_opener,
+            child_counts,
+        ] {
+            pool.put_back(buf);
+        }
+        if let Some(buf) = sorted_scratch {
+            pool.put_back(buf);
+        }
     }
 
     /// Skeleton element count these buffers were sized for.

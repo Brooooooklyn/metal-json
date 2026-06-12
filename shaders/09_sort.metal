@@ -64,14 +64,34 @@ static inline bool mj_sort_identity(uint64_t reserved1) {
 
 // --- sort_hist ------------------------------------------------------------------
 
+// Shallow-document pass skip: `max_key[0]` (the depth scan's max clamped
+// sort key, 08_depth.metal) tells a pass whether EVERY digit it would sort
+// by is zero — `(max_key >> shift) == 0`. Such a pass's stable counting
+// sort is exactly the identity permutation of its input ordering, so
+// sort_scatter degenerates to a coalesced copy and sort_hist /
+// sort_matrix_scan exit up front (their histogram is only ever read by the
+// rank machinery the copy path never touches). The branch is uniform
+// across every threadgroup (one uniform load), so the early exits are
+// convergent. Real-world documents rarely nest deeper than 32, so with the
+// default 1024 depth limit this turns the mandatory second pass into one
+// stream copy.
+static inline bool mj_sort_pass_skips(device const uint* max_key, uint shift) {
+    return (max_key[0] >> shift) == 0u;
+}
+
 kernel void sort_hist(
     device const uint* depths [[buffer(0)]],
     device const uint* order_in [[buffer(1)]], // ignored on identity passes
     device uint* hist [[buffer(2)]],           // 32 x chunks, bucket-major
-    constant MjParams& params [[buffer(3)]],
+    device const uint* max_key [[buffer(3)]],
+    constant MjParams& params [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]])
 {
+    if (mj_sort_pass_skips(max_key, mj_sort_shift(params.reserved1))) {
+        return;
+    }
+
     threadgroup atomic_uint tg_hist[MJ_SORT_BUCKETS];
     if (lid < MJ_SORT_BUCKETS) {
         atomic_store_explicit(&tg_hist[lid], 0u, memory_order_relaxed);
@@ -109,12 +129,18 @@ kernel void sort_hist(
 // total is the skeleton size, which fits u32 by the input-size cap.
 kernel void sort_matrix_scan(
     device uint* hist [[buffer(0)]],
-    constant MjParams& params [[buffer(1)]],
+    device const uint* max_key [[buffer(1)]],
+    constant MjParams& params [[buffer(2)]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_id [[simdgroup_index_in_threadgroup]])
 {
     threadgroup uint parts[9];
+
+    // reserved1 carries the pass shift here too (see encode_structure).
+    if (mj_sort_pass_skips(max_key, mj_sort_shift(params.reserved1))) {
+        return;
+    }
 
     uint n = uint(params.element_count); // 32 * chunks
     uint per = (n + THREADGROUP_SIZE - 1u) / THREADGROUP_SIZE;
@@ -145,7 +171,8 @@ kernel void sort_scatter(
     device const uint* order_in [[buffer(1)]], // ignored on identity passes
     device const uint* hist [[buffer(2)]],     // scanned matrix carries
     device uint* order_out [[buffer(3)]],
-    constant MjParams& params [[buffer(4)]],
+    device const uint* max_key [[buffer(4)]],
+    constant MjParams& params [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -160,6 +187,20 @@ kernel void sort_scatter(
     bool identity = mj_sort_identity(params.reserved1);
     ulong base = ulong(tgid) * ulong(MJ_SKEL_CHUNK_ELEMS)
         + ulong(lid) * ulong(MJ_SKEL_PER_THREAD);
+
+    if (mj_sort_pass_skips(max_key, shift)) {
+        // Every digit is zero: the stable counting sort IS the identity
+        // permutation of this pass's input ordering — emit it as a
+        // coalesced copy and skip the rank machinery (whose hist was never
+        // built; see sort_hist).
+        for (uint j = 0u; j < MJ_SKEL_PER_THREAD; ++j) {
+            ulong t = base + ulong(j);
+            if (t < m) {
+                order_out[t] = identity ? uint(t) : order_in[t];
+            }
+        }
+        return;
+    }
 
     uint elem[MJ_SKEL_PER_THREAD];
     uint digit[MJ_SKEL_PER_THREAD];

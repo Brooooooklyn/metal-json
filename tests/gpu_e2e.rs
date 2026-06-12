@@ -51,12 +51,23 @@ fn file_name(path: &Path) -> &str {
 /// byte-equal. Bytes BETWEEN records (gaps) are unspecified on the GPU and
 /// never compared. Returns the number of string records compared.
 fn assert_tape_and_records_eq(gpu: &Document, cpu: &Document, label: &str) -> usize {
+    assert_raw_tape_and_records_eq(gpu.tape(), gpu.strings().as_bytes(), cpu, label)
+}
+
+/// [`assert_tape_and_records_eq`] over raw GPU-side slices — usable
+/// straight off a `GpuParseOutput` (the pipeline-level pool/poison tests)
+/// as well as a `Document`.
+fn assert_raw_tape_and_records_eq(
+    gpu_tape: &[u64],
+    gpu_bytes: &[u8],
+    cpu: &Document,
+    label: &str,
+) -> usize {
     assert_eq!(
-        gpu.tape(),
+        gpu_tape,
         cpu.tape(),
         "{label}: tape words must be bit-identical"
     );
-    let gpu_bytes = gpu.strings().as_bytes();
     let cpu_bytes = cpu.strings().as_bytes();
     assert_eq!(
         gpu_bytes.len(),
@@ -64,7 +75,7 @@ fn assert_tape_and_records_eq(gpu: &Document, cpu: &Document, label: &str) -> us
         "{label}: string buffer size (raw-length prefix-sum total)"
     );
     let mut records = 0usize;
-    let tape = gpu.tape();
+    let tape = gpu_tape;
     let mut i = 0;
     while i < tape.len() {
         let word = tape[i];
@@ -859,6 +870,320 @@ mod long_strings {
             "raw_len == threshold + 1 takes the valve"
         );
         diff_backends(&gpu, &cpu, over.as_bytes(), "one over threshold");
+    }
+}
+
+// --- 6b. M5: pool reuse, poison, zero-copy input -----------------------------------
+
+/// The M5 structural-overhead work changed three contracts this module
+/// pins: (a) pooled buffers are reused **without** zero fills — a parse
+/// must be bit-exact over arbitrary garbage (poison) in every checked-out
+/// buffer; (b) `Document`s read the shared GPU buffers zero-copy and own
+/// them until drop (on any thread, parser dead or alive); (c) the
+/// zero-copy input paths (`parse_aligned`, mmap `parse_file`) are
+/// verdict- and tape-equal to the copied path on every seam shape.
+mod m5_reuse_and_zero_copy {
+    use std::io::Write;
+
+    use metal_json::gpu::{GpuInput, GpuParse, GpuPipeline};
+    use metal_json::metal::MetalContext;
+    use metal_json::pool::ScratchPool;
+    use metal_json::AlignedInput;
+
+    use super::{assert_raw_tape_and_records_eq, assert_tape_and_records_eq, common, file_name};
+
+    /// GPU gating for the pipeline-level tests, as in `long_strings`.
+    fn pipeline_or_skip(test: &str) -> Option<(MetalContext, GpuPipeline)> {
+        match MetalContext::new() {
+            Ok(ctx) => Some((ctx, GpuPipeline::new())),
+            Err(err) => {
+                if std::env::var_os("METAL_JSON_REQUIRE_GPU").is_some_and(|v| v == "1") {
+                    panic!("METAL_JSON_REQUIRE_GPU=1 but no usable Metal device: {err}");
+                }
+                eprintln!("SKIP {test}: no usable Metal device here ({err})");
+                None
+            }
+        }
+    }
+
+    /// Small inputs covering every CB3 producer (containers, fast/escaped
+    /// strings, numbers incl. a fixup-path literal, literals, root
+    /// scalars) plus rejections from every stage.
+    fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("worked example", br#"{"a":[1,2.5],"b":"x\n"}"#.to_vec()),
+            ("root int", b"42".to_vec()),
+            ("root string", br#""xA""#.to_vec()),
+            ("root true", b"true".to_vec()),
+            ("literals", b"[true,false,null]".to_vec()),
+            (
+                "fixup number",
+                format!(
+                    r#"{{"k":[{},2],"s":"v"}}"#,
+                    "1.00000000000000011102230246251565404236316680908203125"
+                )
+                .into_bytes(),
+            ),
+            (
+                "escape dense",
+                r#"["A\n\\","😀",{"\"":"\t"}]"#.as_bytes().to_vec(),
+            ),
+            ("utf8 reject", b"ab\x80".to_vec()),
+            ("layer1 reject", b"[1 true]".to_vec()),
+            ("structure reject", b"[1".to_vec()),
+            ("number reject", b"[01]".to_vec()),
+            ("string reject", br#"["\q"]"#.to_vec()),
+            ("empty", Vec::new()),
+        ]
+    }
+
+    /// THE poison test: one shared pool across the whole corpus + fixture
+    /// sweep, free buffers filled with 0xDB before every parse. Bit-exact
+    /// tapes and records (and identical verdicts on rejects) prove no
+    /// kernel or CPU step reads a byte it did not write — the contract
+    /// that let the M5 work drop the tape/stringbuf zero fills and pool
+    /// buffers without resets.
+    #[test]
+    fn pooled_parses_over_poisoned_buffers_are_bit_exact() {
+        let Some((ctx, pipeline)) =
+            pipeline_or_skip("pooled_parses_over_poisoned_buffers_are_bit_exact")
+        else {
+            return;
+        };
+        let cpu = common::cpu_parser();
+        let pool = ScratchPool::new();
+
+        let mut cases: Vec<(String, Vec<u8>)> = fixtures()
+            .into_iter()
+            .map(|(label, bytes)| (label.to_owned(), bytes))
+            .collect();
+        for path in common::corpus_files() {
+            let bytes = std::fs::read(&path).expect("readable corpus fixture");
+            cases.push((file_name(&path).to_owned(), bytes));
+        }
+
+        // Two sweeps over everything: the first grows the pool (different
+        // sizes contaminate each other's buffers), the second re-checks
+        // every input over a fully warmed, poisoned pool.
+        for sweep in 0..2 {
+            for (label, input) in &cases {
+                let label = format!("{label} (sweep {sweep})");
+                pool.poison_free_buffers(0xDB);
+                let parse = pipeline
+                    .run_pooled(&ctx, &pool, GpuInput::Bytes(input), 1024)
+                    .unwrap_or_else(|e| panic!("{label}: pipeline failed: {e}"));
+                match (parse, cpu.parse(input)) {
+                    (GpuParse::Accepted(out), Ok(cpu_doc)) => {
+                        let strings = out.stringbuf.as_ref().map_or(&[][..], |b| b.contents());
+                        assert_raw_tape_and_records_eq(
+                            out.tape.as_slice::<u64>(),
+                            strings,
+                            &cpu_doc,
+                            &label,
+                        );
+                        // Hand the document buffers back so the next parse
+                        // reuses (and re-poisons) them.
+                        pool.put_back(out.tape);
+                        if let Some(buf) = out.stringbuf {
+                            pool.put_back(buf);
+                        }
+                    }
+                    (GpuParse::Rejected(_), Err(_)) => {} // verdict parity; WHICH may differ
+                    (GpuParse::Accepted(_), Err(e)) => {
+                        panic!("{label}: GPU accepted, reference rejected ({e})")
+                    }
+                    (GpuParse::Rejected(packed), Ok(_)) => panic!(
+                        "{label}: GPU rejected ({:?}), reference accepted",
+                        (packed >> 32, packed as u32)
+                    ),
+                }
+            }
+        }
+        assert!(pool.free_len() > 0, "the pool must actually be reused");
+    }
+
+    /// Pool reuse through the public `Parser`: one parser, every corpus
+    /// file parsed twice with size-mixed interleaving (so checked-out
+    /// buffers carry other documents' garbage), every result bit-exact vs
+    /// the reference — and steady state allocates nothing new (the pool's
+    /// free list stops growing).
+    #[test]
+    fn parser_buffer_reuse_across_sizes_is_bit_exact() {
+        let Some(gpu) = common::gpu_parser_or_skip("parser_buffer_reuse_across_sizes_is_bit_exact")
+        else {
+            return;
+        };
+        let cpu = common::cpu_parser();
+        let files: Vec<_> = common::corpus_files();
+        assert!(!files.is_empty());
+
+        for round in 0..3 {
+            // Alternate sweep direction so sizes interleave both ways.
+            let order: Vec<_> = if round % 2 == 0 {
+                files.iter().collect()
+            } else {
+                files.iter().rev().collect()
+            };
+            for path in order {
+                let bytes = std::fs::read(path).expect("readable corpus fixture");
+                let label = format!("{} (round {round})", file_name(path));
+                let gpu_doc = gpu
+                    .parse(&bytes)
+                    .unwrap_or_else(|e| panic!("{label}: GPU parse failed: {e}"));
+                let cpu_doc = cpu.parse(&bytes).expect("corpus parses on the reference");
+                assert_tape_and_records_eq(&gpu_doc, &cpu_doc, &label);
+                common::assert_docs_eq(gpu_doc.root(), cpu_doc.root(), &label);
+            }
+        }
+    }
+
+    /// `parse_aligned` (bytesNoCopy over a caller-held `AlignedInput`) is
+    /// tape- and verdict-equal to the copied path on the corpus and on
+    /// every padding seam shape: lengths ≡ 0/1/63 (mod 64), an exact
+    /// page-multiple document, a trailing root scalar at EOF, and a
+    /// multi-byte UTF-8 sequence truncated exactly at EOF.
+    #[test]
+    fn parse_aligned_matches_parse_on_corpus_and_seams() {
+        let Some(gpu) = common::gpu_parser_or_skip("parse_aligned_matches_parse_on_corpus_and_seams")
+        else {
+            return;
+        };
+
+        let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+        for path in common::corpus_files() {
+            cases.push((
+                file_name(&path).to_owned(),
+                std::fs::read(&path).expect("readable corpus fixture"),
+            ));
+        }
+        // Seam shapes: pad with trailing spaces (legal JSON whitespace) to
+        // hit exact word/page boundaries.
+        let pad_to = |json: &[u8], target: usize| {
+            let mut v = json.to_vec();
+            assert!(v.len() <= target);
+            v.resize(target, b' ');
+            v
+        };
+        cases.push(("len 64k".into(), pad_to(br#"[1,2,3]"#, 64)));
+        cases.push(("len 65".into(), pad_to(br#"[1,2,3]"#, 65)));
+        cases.push(("len 63".into(), pad_to(br#"[1,2,3]"#, 63)));
+        cases.push(("len page".into(), pad_to(br#"{"k":"v"}"#, 16384)));
+        cases.push(("scalar at EOF".into(), b"12345".to_vec()));
+        cases.push(("truncated utf8 at EOF".into(), b"[\"a\xC3".to_vec()));
+        cases.push(("empty".into(), Vec::new()));
+
+        for (label, bytes) in &cases {
+            let aligned = AlignedInput::from_slice(bytes);
+            match (gpu.parse_aligned(&aligned), gpu.parse(bytes)) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.tape(), b.tape(), "{label}: tape (aligned vs copied)");
+                    common::assert_docs_eq(a.root(), b.root(), label);
+                }
+                (Err(a), Err(b)) => assert_eq!(
+                    format!("{a:?}"),
+                    format!("{b:?}"),
+                    "{label}: error parity (aligned vs copied)"
+                ),
+                (a, b) => panic!(
+                    "{label}: verdicts diverge — aligned {:?} vs copied {:?}",
+                    a.map(|d| d.tape().len()),
+                    b.map(|d| d.tape().len())
+                ),
+            }
+        }
+    }
+
+    /// mmap-backed `parse_file` (zero-copy, COW tail padding) matches
+    /// `parse` on every corpus file plus the tail edge cases: a document
+    /// of exactly one page (no tail to pad) and a truncated UTF-8 sequence
+    /// at EOF (the COW space padding must keep the reference offset).
+    #[test]
+    fn parse_file_matches_parse_on_corpus_and_edges() {
+        let Some(gpu) = common::gpu_parser_or_skip("parse_file_matches_parse_on_corpus_and_edges")
+        else {
+            return;
+        };
+
+        for path in common::corpus_files() {
+            let bytes = std::fs::read(&path).expect("readable corpus fixture");
+            let label = file_name(&path).to_owned();
+            let from_file = gpu
+                .parse_file(&path)
+                .unwrap_or_else(|e| panic!("{label}: parse_file failed: {e}"));
+            let from_bytes = gpu.parse(&bytes).expect("corpus parses");
+            assert_eq!(from_file.tape(), from_bytes.tape(), "{label}: tape");
+            common::assert_docs_eq(from_file.root(), from_bytes.root(), &label);
+        }
+
+        // Edge files in a temp dir: exact-page length (no COW tail), a
+        // 64-multiple length, truncated UTF-8 at EOF, and empty.
+        let dir = std::env::temp_dir().join(format!("metal-json-m5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut page_doc = br#"{"k":"v"}"#.to_vec();
+        page_doc.resize(16384, b' ');
+        let mut word_doc = br#"[1,2,3]"#.to_vec();
+        word_doc.resize(128, b' ');
+        let edge_cases: Vec<(&str, Vec<u8>)> = vec![
+            ("page.json", page_doc),
+            ("word.json", word_doc),
+            ("trunc-utf8.json", b"[\"a\xC3".to_vec()),
+            ("empty.json", Vec::new()),
+            ("scalar.json", b"12345".to_vec()),
+        ];
+        for (name, bytes) in &edge_cases {
+            let path = dir.join(name);
+            let mut f = std::fs::File::create(&path).expect("temp file");
+            f.write_all(bytes).expect("write temp file");
+            drop(f);
+            match (gpu.parse_file(&path), gpu.parse(bytes)) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.tape(), b.tape(), "{name}: tape (file vs bytes)");
+                    common::assert_docs_eq(a.root(), b.root(), name);
+                }
+                (Err(a), Err(b)) => assert_eq!(
+                    format!("{a:?}"),
+                    format!("{b:?}"),
+                    "{name}: error parity (file vs bytes)"
+                ),
+                (a, b) => panic!(
+                    "{name}: verdicts diverge — file {:?} vs bytes {:?}",
+                    a.map(|d| d.tape().len()),
+                    b.map(|d| d.tape().len())
+                ),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Zero-copy `Document`s are self-contained `Send + Sync` values: they
+    /// outlive the parser that produced them, move to other threads, read
+    /// identically there, and drop there (returning their buffers to the
+    /// still-alive pool through the `Arc` handle).
+    #[test]
+    fn documents_outlive_the_parser_and_drop_on_other_threads() {
+        let doc = {
+            let Some(gpu) =
+                common::gpu_parser_or_skip("documents_outlive_the_parser_and_drop_on_other_threads")
+            else {
+                return;
+            };
+            let doc = gpu
+                .parse(br#"{"k":[1,"s",2.5],"x":"y"}"#)
+                .expect("document parses");
+            // Parser (device, pipelines, pool handle) drops HERE; the
+            // document must stay fully readable.
+            doc
+        };
+        assert_eq!(doc.root().get("k").unwrap().at(1).unwrap().as_str(), Some("s"));
+
+        let handle = std::thread::spawn(move || {
+            let k = doc.root().get("k").unwrap();
+            assert_eq!(k.at(0).unwrap().as_i64(), Some(1));
+            assert_eq!(k.at(2).unwrap().as_f64(), Some(2.5));
+            assert_eq!(doc.root().get("x").unwrap().as_str(), Some("y"));
+            drop(doc); // pool return on a foreign thread
+        });
+        handle.join().expect("cross-thread document use must not panic");
     }
 }
 

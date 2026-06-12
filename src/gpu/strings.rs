@@ -14,13 +14,15 @@
 //!                             carries refined by an in-chunk scan into the
 //!                             exclusive `raw_len + 5` prefix sum
 //!                             (docs/tape-format.md's pinned offset policy)
-//!      strings_unescape       K11: 1 thread / string-list entry — fast
-//!                             16-byte-block path for escape-free spans,
-//!                             sequential escape path (`\" \\ \/ \b \f \n
-//!                             \r \t`, `\uXXXX` incl. surrogate pairs);
-//!                             writes the [u32 LE len][content][NUL] record
-//!                             and the `"` tape word at tape_ofs[token];
-//!                             per-chunk min-reduced error words
+//!      strings_unescape       K11: 1 thread / string-list entry —
+//!                             lane-parallel / simdgroup-cooperative clean
+//!                             copy for escape-free strings, threadgroup-
+//!                             compacted sequential escape path (`\" \\ \/
+//!                             \b \f \n \r \t`, `\uXXXX` incl. surrogate
+//!                             pairs) for the rest; writes the
+//!                             [u32 LE len][content][NUL] record and the
+//!                             `"` tape word at tape_ofs[token]; per-chunk
+//!                             min-reduced error words
 //!      structure_finalize     (reused from CB3) error fold → header
 //!   ── commit, wait: CPU sync reads the header. A string error REJECTS
 //!      the input: the record/tape outputs are never produced (the stage-2
@@ -89,6 +91,7 @@ use crate::metal::{Dispatch, GpuBuffer, MetalContext, MjParams, THREADGROUP_SIZE
 use crate::stage::{Stage, Stage1Buffers};
 use crate::tape::{STRING_RECORD_HEADER_BYTES, make_string};
 
+use super::stage1::Stage1Output;
 use super::stage2::{Stage2, Stage2Accepted, Stage2Output, Stage2Run};
 
 /// `MjErrorCode` value for `SyntaxErrorKind::InvalidStringEscape`. Mirrors
@@ -264,17 +267,17 @@ impl StringsStage {
     ) -> Result<StringsOutput> {
         // --- CB1 → CB2 → CB2b (stage 2 owns the first two syncs) -----------
         let Stage2Accepted {
-            stage1,
             bufs2,
             header,
             gpu_seconds: _,
-        } = match self.stage2.run_to_lists(ctx, bufs1)? {
-            Stage2Run::Rejected(out) => {
-                let packed = out.error.expect("rejected runs carry an error");
-                return Ok(StringsOutput::rejected(*out, packed));
+        } = match self.stage2.run_to_lists(ctx, crate::pool::Alloc::Direct, bufs1)? {
+            Stage2Run::Rejected(rejection) => {
+                let out = Stage2Output::from_rejection(bufs1, &rejection);
+                return Ok(StringsOutput::rejected(out, rejection.packed));
             }
             Stage2Run::Accepted(run) => *run,
         };
+        let stage1 = Stage1Output::snapshot(bufs1, &header, None);
         let stage2_out = Stage2::collect_outputs(stage1, &bufs2, &header);
 
         let token_total = bufs2.token_total();
