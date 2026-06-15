@@ -15,7 +15,7 @@ jobs:
   # (`xcrun -sdk macosx metal`) — see build.rs.
   release-plz-release:
     name: Release-plz release
-    runs-on: macos-15
+    runs-on: macos-26
     if: ${{ github.repository_owner == 'Brooooooklyn' }}
     permissions:
       contents: write

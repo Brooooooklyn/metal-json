@@ -20,7 +20,7 @@ jobs:
     # instead. CI still covers the entire CPU side: the cpu-reference
     # oracle test suite (the bit-exact spec the GPU kernels diff against),
     # build, clippy, and the bench/xtask crates.
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Build
