@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true
+  },
+  "packageRules": [
+    {
+      "description": "Group all non-major Cargo updates into one PR",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "cargo non-major"
+    },
+    {
+      "description": "Group GitHub Actions updates and automerge non-major",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "Rust toolchain bumps reviewed manually (new compiler lints can fail clippy -D warnings)",
+      "matchManagers": ["rust-toolchain"],
+      "groupName": "rust toolchain"
+    }
+  ]
+}
