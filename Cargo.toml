@@ -13,14 +13,14 @@ repository = "https://github.com/Brooooooklyn/metal-json"
 include = ["src/**", "shaders/**", "build.rs", "README.md", "LICENSE"]
 
 [dependencies]
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-metal = "0.3"
-block2 = "0.6"
-dispatch2 = "0.3"
-memmap2 = "0.9"
-serde = { version = "1", optional = true }
-thiserror = "2"
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+memmap2 = "0.9.10"
+serde = { version = "1.0.228", optional = true }
+thiserror = "2.0.18"
 
 [features]
 default = []
@@ -36,9 +36,9 @@ timing = []
 serde = ["dep:serde"]
 
 [dev-dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
-proptest = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order", "arbitrary_precision"] }
+proptest = "1.11.0"
 
 [[example]]
 name = "parse_breakdown"
