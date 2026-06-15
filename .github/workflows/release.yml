@@ -1,0 +1,63 @@
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # Release unpublished versions to crates.io via Trusted Publishing (OIDC).
+  # Runs on macOS because the default build embeds an AOT-built metallib, so
+  # `cargo publish`'s verification build needs the Xcode Metal toolchain
+  # (`xcrun -sdk macosx metal`) — see build.rs.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: macos-15
+    if: ${{ github.repository_owner == 'Brooooooklyn' }}
+    permissions:
+      contents: write
+      id-token: write # OIDC token exchange with crates.io (Trusted Publishing)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No CARGO_REGISTRY_TOKEN: release-plz performs the crates.io OIDC
+          # token exchange itself when id-token: write is granted.
+
+  # Open/update a PR that bumps versions and writes CHANGELOG.md from the
+  # conventional commits since the last release. No build, so Linux is fine.
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'Brooooooklyn' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
