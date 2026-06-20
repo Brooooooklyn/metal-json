@@ -22,7 +22,7 @@ jobs:
     # build, clippy, and the bench/xtask crates.
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build
         run: cargo build --workspace
       - name: Fetch JSONTestSuite
