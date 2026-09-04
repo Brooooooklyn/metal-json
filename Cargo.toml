@@ -19,8 +19,8 @@ objc2-metal = "0.3.2"
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 memmap2 = "0.9.11"
-serde = { version = "1.0.228", optional = true }
-thiserror = "2.0.18"
+serde = { version = "1.0.229", optional = true }
+thiserror = "2.0.20"
 
 [features]
 default = []
@@ -36,8 +36,8 @@ timing = []
 serde = ["dep:serde"]
 
 [dev-dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["preserve_order", "arbitrary_precision"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "arbitrary_precision"] }
 proptest = "1.11.0"
 
 [[example]]
